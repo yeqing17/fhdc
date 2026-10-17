@@ -1,0 +1,15 @@
+[package]
+name = "fhdc-device"
+description = "fhdc 设备注册表:连接代数与会话安全"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fhdc-domain.workspace = true
+
+[dev-dependencies]

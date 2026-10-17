@@ -1,0 +1,18 @@
+[package]
+name = "fhdc-fake"
+description = "fhdc 的假后端:无设备时体验完整界面"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fhdc-domain.workspace = true
+fhdc-hdc.workspace = true
+async-trait.workspace = true
+image.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

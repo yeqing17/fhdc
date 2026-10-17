@@ -1,0 +1,15 @@
+[package]
+name = "fhdc-domain"
+description = "fhdc 领域词汇层:类型、错误与后端命令/事件"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
