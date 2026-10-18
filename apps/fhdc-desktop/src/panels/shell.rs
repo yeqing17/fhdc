@@ -26,6 +26,8 @@ const MAX_TAIL_LINES: usize = 5000;
 const MAX_TAIL_BYTES: usize = 256 * 1024;
 /// 未换行残留的上限:超过就强制断行,避免无换行输出撑爆内存。
 const MAX_PENDING_BYTES: usize = 64 * 1024;
+/// ANSI 转义续接尾巴的上限:超过视为畸形序列,按字面量放行。
+const ANSI_PENDING_LIMIT: usize = 4096;
 /// 输入历史上限。
 const MAX_HISTORY: usize = 64;
 
@@ -104,7 +106,6 @@ impl ShellState {
         self.status = Status::Disconnected;
         self.error = None;
         self.clear_display();
-        self.utf8 = super::Utf8Accumulator::new();
         self.input.clear();
         self.history_cursor = None;
         self.last_connect_attempt = None;
@@ -213,6 +214,8 @@ impl ShellState {
         self.pending_line.clear();
         self.tail_bytes = 0;
         self.ansi_pending.clear();
+        // 半个汉字可能正卡在解码残片里,一并重置,避免清屏后首字符乱码。
+        self.utf8 = super::Utf8Accumulator::new();
     }
 
     /// 完整回显文本(复制全部用)。
@@ -470,8 +473,15 @@ fn ansi_sequence_end(chars: &[char], index: usize) -> Option<usize> {
 fn strip_ansi_stream(pending: &mut String, input: &str) -> String {
     let mut source = std::mem::take(pending);
     source.push_str(input);
-    let chars: Vec<char> = source.chars().collect();
+    // 畸形转义保险:待续接的尾巴超过上限(终止符迟迟不来,cat 二进制
+    // 常见),放弃续接按字面量吐出,避免 pending 无界增长并吞掉显示。
     let mut output = String::with_capacity(source.len());
+    if source.len() > ANSI_PENDING_LIMIT {
+        output.push_str(&source);
+        *pending = String::new();
+        return output;
+    }
+    let chars: Vec<char> = source.chars().collect();
     let mut index = 0;
     while index < chars.len() {
         let ch = chars[index];
@@ -483,10 +493,15 @@ fn strip_ansi_stream(pending: &mut String, input: &str) -> String {
         } else if ch == '\r' {
             if chars.get(index + 1) == Some(&'\n') {
                 index += 2;
+                output.push('\n');
+            } else if index + 1 == chars.len() {
+                // 块尾的孤立 CR:可能是被切断的 CRLF,留到下一块判断,
+                // 否则跨块的 \r\n 会变成两个换行。
+                break;
             } else {
                 index += 1;
+                output.push('\n');
             }
-            output.push('\n');
         } else {
             output.push(ch);
             index += 1;
@@ -544,5 +559,42 @@ mod tests {
         let mut pending = String::new();
         assert_eq!(strip_ansi_stream(&mut pending, "a\rb\r\n"), "a\nb\n");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn holds_chunk_final_cr_to_detect_crlf() {
+        // \r 与 \n 被切在两块:不能输出两个换行。
+        let mut pending = String::new();
+        assert_eq!(strip_ansi_stream(&mut pending, "a\r"), "a");
+        assert_eq!(strip_ansi_stream(&mut pending, "\nb"), "\nb");
+        assert!(pending.is_empty());
+        // 块尾孤立 CR 后面跟的不是 \n:按单个换行处理。
+        let mut pending = String::new();
+        assert_eq!(strip_ansi_stream(&mut pending, "x\r"), "x");
+        assert_eq!(strip_ansi_stream(&mut pending, "y"), "\ny");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn flushes_degenerate_escape_as_literal() {
+        // 永不终止的"转义"超过上限后按字面量放行,不再吞内容。
+        // 填充用 ';'(0x3B):它是纯 CSI 参数字节,永远不会终止序列
+        // (字母如 'x' 落在 0x40..=0x7E,本身就能当终止符)。
+        let mut pending = String::new();
+        let mut first = String::from("\x1b[");
+        for _ in 0..3000 {
+            first.push(';');
+        }
+        assert_eq!(strip_ansi_stream(&mut pending, &first), "");
+        // 再压进一段,总长超过上限:整个尾巴按字面量吐出。
+        let mut second = String::new();
+        for _ in 0..2000 {
+            second.push(';');
+        }
+        let flushed = strip_ansi_stream(&mut pending, &second);
+        assert!(flushed.starts_with('\x1b'));
+        assert_eq!(flushed.chars().count(), 2 + 5000);
+        assert!(pending.is_empty());
+        assert_eq!(strip_ansi_stream(&mut pending, "tail"), "tail");
     }
 }

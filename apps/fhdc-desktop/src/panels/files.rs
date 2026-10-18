@@ -62,13 +62,18 @@ pub struct FilesState {
 }
 
 impl FilesState {
-    /// 让列表与排序缓存一起失效。所有改动 `entries` 的路径都必须走这里,
-    /// 否则新数据到达前会继续画上一份列表。
-    fn invalidate_entries(&mut self) {
-        self.entries.clear();
+    /// `entries` 的唯一写入口:赋值同时失效排序缓存并递增代数。
+    /// 所有改动列表的路径都走这里,防止再漏掉缓存失效。
+    fn set_entries(&mut self, entries: Vec<RemoteFileEntry>) {
+        self.entries = entries;
         self.sorted_cache.clear();
         self.sort_cache_key = None;
         self.entries_generation += 1;
+    }
+
+    /// 让列表与排序缓存一起失效。
+    fn invalidate_entries(&mut self) {
+        self.set_entries(Vec::new());
     }
 
     pub fn reset_for(&mut self, target: Option<DeviceTarget>) {
@@ -129,8 +134,7 @@ impl FilesState {
                     self.loading = false;
                     self.error = None;
                     if self.path.as_ref() == Some(path) {
-                        self.entries = entries.clone();
-                        self.entries_generation += 1;
+                        self.set_entries(entries.clone());
                     }
                 }
             }

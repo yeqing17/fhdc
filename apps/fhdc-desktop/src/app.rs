@@ -261,7 +261,19 @@ impl FhdcApp {
                 self.show_toast(format!("连接成功: {message}"));
                 self.remember_endpoint(endpoint.clone());
                 if let Ok(key) = ConnectKey::new(endpoint.target_string()) {
-                    self.pending_select = Some((key, Instant::now()));
+                    // 连接成功会立刻触发一次重发现,DevicesChanged 可能
+                    // 先于本事件到达(快照已含新设备且不再变化、不会再广播)。
+                    // 所以快照里已经有了就直接选,不等下一次广播。
+                    if self
+                        .snapshot
+                        .devices
+                        .iter()
+                        .any(|record| record.descriptor.key == key)
+                    {
+                        self.send(BackendCommand::SelectDevice { key: Some(key) });
+                    } else {
+                        self.pending_select = Some((key, Instant::now()));
+                    }
                 }
             }
             BackendEvent::EndpointConnectFailed { endpoint, error } => {

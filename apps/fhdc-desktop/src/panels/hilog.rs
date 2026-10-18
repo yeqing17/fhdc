@@ -364,22 +364,23 @@ impl HilogState {
         let visible_len = self.visible.len();
 
         let stick = self.auto_scroll;
-        // 行高用字体实际行高;行间纵向间距清零,避免全局 8px 间距
-        // 把日志行撑成双倍行距。
-        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-        let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, true])
-            .stick_to_bottom(stick)
-            .show_rows(ui, row_height, visible_len, |ui, range| {
-                let frame = egui::Frame::new()
-                    .fill(palette.terminal_bg)
-                    .corner_radius(4.0)
-                    .inner_margin(6.0);
-                frame.show(ui, |ui| {
-                    ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.set_min_width(ui.available_width());
+        // 与终端面板同构:frame 在外,间距清零与行高计算都发生在
+        // show_rows 的调用方 ui 上 —— egui 用调用方的 item_spacing
+        // 预估内容高度,放进闭包内部会导致"虚高 8px/行"的幻影滚动区。
+        let frame = egui::Frame::new()
+            .fill(palette.terminal_bg)
+            .corner_radius(4.0)
+            .inner_margin(6.0);
+        frame.show(ui, |ui| {
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+            let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
+            ui.set_min_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .stick_to_bottom(stick)
+                .show_rows(ui, row_height, visible_len, |ui, range| {
                     for index in range {
                         let Some(buffer_index) = self.visible.get(index).copied() else {
                             continue;
@@ -394,7 +395,7 @@ impl HilogState {
                         );
                     }
                 });
-            });
+        });
         commands
     }
 }
