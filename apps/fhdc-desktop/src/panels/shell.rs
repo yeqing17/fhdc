@@ -471,16 +471,18 @@ fn ansi_sequence_end(chars: &[char], index: usize) -> Option<usize> {
 /// 流式清洗 ANSI 转义并把 CR 归一为 LF。转义序列可能被分块切断,
 /// 不完整的尾巴存进 `pending`,与下一块拼接后重新处理。
 fn strip_ansi_stream(pending: &mut String, input: &str) -> String {
+    let mut output = String::with_capacity(input.len() + 16);
+    // 畸形转义保险只针对"跨块残留的尾巴":尾巴本身超限才放弃续接、
+    // 按字面量放行。不能拿合并后的 source 一起量 —— 底层单块分片
+    // 8KB、合并上限 64KB,都远大于 4KB 阈值,否则任何大块输出都会
+    // 整段绕过清洗(转义字面量与 \r 全部漏网)。
+    if pending.len() > ANSI_PENDING_LIMIT {
+        output.push_str(&std::mem::take(pending));
+    }
     let mut source = std::mem::take(pending);
     source.push_str(input);
-    // 畸形转义保险:待续接的尾巴超过上限(终止符迟迟不来,cat 二进制
-    // 常见),放弃续接按字面量吐出,避免 pending 无界增长并吞掉显示。
-    let mut output = String::with_capacity(source.len());
-    if source.len() > ANSI_PENDING_LIMIT {
-        output.push_str(&source);
-        *pending = String::new();
-        return output;
-    }
+    // 每块一次 Vec<char>(64KB 事件约 256KB 临时分配):高频输出下
+    // 每秒几十次,量级可接受;换来转义/CR 跨块处理的简单实现。
     let chars: Vec<char> = source.chars().collect();
     let mut index = 0;
     while index < chars.len() {
@@ -577,7 +579,7 @@ mod tests {
 
     #[test]
     fn flushes_degenerate_escape_as_literal() {
-        // 永不终止的"转义"超过上限后按字面量放行,不再吞内容。
+        // 永不终止的"转义"尾巴本身超过上限后按字面量放行,不再吞内容。
         // 填充用 ';'(0x3B):它是纯 CSI 参数字节,永远不会终止序列
         // (字母如 'x' 落在 0x40..=0x7E,本身就能当终止符)。
         let mut pending = String::new();
@@ -586,15 +588,36 @@ mod tests {
             first.push(';');
         }
         assert_eq!(strip_ansi_stream(&mut pending, &first), "");
-        // 再压进一段,总长超过上限:整个尾巴按字面量吐出。
+        assert_eq!(pending.chars().count(), 2 + 3000);
+        // 第二段:尾巴仍在上限内,继续等终止符——大块输入不受影响。
         let mut second = String::new();
-        for _ in 0..2000 {
+        for _ in 0..1500 {
             second.push(';');
         }
-        let flushed = strip_ansi_stream(&mut pending, &second);
+        assert_eq!(strip_ansi_stream(&mut pending, &second), "");
+        assert_eq!(pending.chars().count(), 2 + 4500);
+        // 第三段:进入函数时尾巴已超 4KB,按字面量放行;本段输入正常清洗。
+        let flushed = strip_ansi_stream(&mut pending, ";tail");
         assert!(flushed.starts_with('\x1b'));
-        assert_eq!(flushed.chars().count(), 2 + 5000);
+        assert_eq!(flushed.chars().count(), 2 + 4500 + ";tail".chars().count());
         assert!(pending.is_empty());
-        assert_eq!(strip_ansi_stream(&mut pending, "tail"), "tail");
+    }
+
+    #[test]
+    fn large_chunks_still_get_stripped() {
+        // 回归:畸形保险只看残留尾巴。超过 4KB 的大块输入(底层单块
+        // 分片 8KB)必须照常清洗,不能整段按字面量放行。
+        let mut pending = String::new();
+        let mut big = String::new();
+        for _ in 0..600 {
+            big.push_str("\x1b[32mA\x1b[0m\r\n");
+        }
+        assert!(big.len() > 8192 / 2);
+        let cleaned = strip_ansi_stream(&mut pending, &big);
+        assert_eq!(cleaned.matches('A').count(), 600);
+        assert_eq!(cleaned.matches('\n').count(), 600);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(!cleaned.contains('\r'));
+        assert!(pending.is_empty());
     }
 }

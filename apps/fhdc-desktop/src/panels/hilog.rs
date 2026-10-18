@@ -377,6 +377,20 @@ impl HilogState {
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
             let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
             ui.set_min_width(ui.available_width());
+            if visible_len == 0 {
+                // 空态占住一块区域并给出提示,与终端面板一致,
+                // 避免塌成只剩边距的一条细边。
+                ui.set_min_height(160.0);
+                ui.label(
+                    egui::RichText::new(if self.running {
+                        "等待日志…"
+                    } else {
+                        "点击「开始」抓取设备日志"
+                    })
+                    .weak(),
+                );
+                return;
+            }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
                 .stick_to_bottom(stick)
