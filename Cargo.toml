@@ -22,7 +22,9 @@ fhdc-fake = { path = "crates/fhdc-fake" }
 fhdc-device = { path = "crates/fhdc-device" }
 async-trait = "0.1.91"
 arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
-eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+# wayland/x11 让依赖树在 Linux 上也能编译(release 流水线的 validate
+# 在 ubuntu 上跑 clippy);Windows 构建不受影响。
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.15.4"
 serde = { version = "1.0.228", features = ["derive"] }
