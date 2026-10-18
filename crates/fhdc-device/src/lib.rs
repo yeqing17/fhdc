@@ -82,8 +82,18 @@ impl DeviceRegistry {
     }
 
     pub fn snapshot(&self) -> DeviceSnapshot {
+        let mut devices: Vec<DeviceRecord> = self.records.values().cloned().collect();
+        // HashMap 迭代顺序由随机种子决定;发现轮询每 2 秒重建一次快照,
+        // 不排序的话设备下拉框顺序会持续抖动。在线设备置顶,其余按键序。
+        devices.sort_by(|a, b| {
+            b.descriptor
+                .state
+                .is_online()
+                .cmp(&a.descriptor.state.is_online())
+                .then_with(|| a.descriptor.key.cmp(&b.descriptor.key))
+        });
         DeviceSnapshot {
-            devices: self.records.values().cloned().collect(),
+            devices,
             selected: self.selected.clone(),
         }
     }
@@ -169,5 +179,32 @@ mod tests {
         let fresh = registry.snapshot().devices[0].target();
         assert!(registry.current_online(&fresh).is_some());
         assert_eq!(registry.current_online_target(), Some(fresh));
+    }
+
+    #[test]
+    fn snapshot_order_is_stable_and_online_first() {
+        // 同一组设备反复生成快照,顺序必须一致:在线置顶,其余按连接键。
+        let mut registry = DeviceRegistry::new();
+        registry.reconcile(vec![
+            descriptor("KEY_C", DeviceState::Connected),
+            descriptor("KEY_A", DeviceState::Offline),
+            descriptor("KEY_B", DeviceState::Connected),
+        ]);
+        let first: Vec<String> = registry
+            .snapshot()
+            .devices
+            .iter()
+            .map(|record| record.descriptor.key.as_str().to_owned())
+            .collect();
+        for _ in 0..16 {
+            let again: Vec<String> = registry
+                .snapshot()
+                .devices
+                .iter()
+                .map(|record| record.descriptor.key.as_str().to_owned())
+                .collect();
+            assert_eq!(again, first);
+        }
+        assert_eq!(first, vec!["KEY_B", "KEY_C", "KEY_A"]);
     }
 }

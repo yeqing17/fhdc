@@ -95,24 +95,30 @@ impl AppsState {
                     self.error = Some(error.detail.clone());
                 }
             }
-            BackendEvent::BundleDetailsLoading(_, bundle) => {
-                if self.selected.as_ref() == Some(bundle) {
+            BackendEvent::BundleDetailsLoading(target, bundle) => {
+                // 目标与所选包双重校验:切设备后旧结果不落到新页面。
+                if self.target.as_ref() == Some(target) && self.selected.as_ref() == Some(bundle) {
                     self.details_loading = true;
                 }
             }
-            BackendEvent::BundleDetailsLoaded(_, details) => {
-                if self.selected.as_ref() == Some(&details.name) {
+            BackendEvent::BundleDetailsLoaded(target, details) => {
+                if self.target.as_ref() == Some(target)
+                    && self.selected.as_ref() == Some(&details.name)
+                {
                     self.details_loading = false;
                     self.details = Some(details.clone());
                 }
             }
-            BackendEvent::BundleDetailsFailed(_, bundle, error) => {
-                if self.selected.as_ref() == Some(bundle) {
+            BackendEvent::BundleDetailsFailed(target, bundle, error) => {
+                if self.target.as_ref() == Some(target) && self.selected.as_ref() == Some(bundle) {
                     self.details_loading = false;
                     self.error = Some(error.detail.clone());
                 }
             }
-            BackendEvent::AppActionCompleted(_, bundle, action, message) => {
+            BackendEvent::AppActionCompleted(target, bundle, action, message) => {
+                if self.target.as_ref() != Some(target) {
+                    return;
+                }
                 self.install_note = Some(format!(
                     "{} {}: {}",
                     app_action_label(*action),
@@ -123,22 +129,34 @@ impl AppsState {
                     self.bundles.retain(|record| record.name != *bundle);
                 }
             }
-            BackendEvent::AppActionFailed(_, _, action, error) => {
+            BackendEvent::AppActionFailed(target, _, action, error) => {
+                if self.target.as_ref() != Some(target) {
+                    return;
+                }
                 self.error = Some(format!(
                     "{}失败: {}",
                     app_action_label(*action),
                     error.detail
                 ));
             }
-            BackendEvent::HapInstallStarted(_, label) => {
+            BackendEvent::HapInstallStarted(target, label) => {
+                if self.target.as_ref() != Some(target) {
+                    return;
+                }
                 self.installing = Some(label.clone());
                 self.install_note = None;
             }
-            BackendEvent::HapInstallFinished(_, message) => {
+            BackendEvent::HapInstallFinished(target, message) => {
+                if self.target.as_ref() != Some(target) {
+                    return;
+                }
                 self.installing = None;
                 self.install_note = Some(format!("安装完成: {message}"));
             }
-            BackendEvent::HapInstallFailed(_, error) => {
+            BackendEvent::HapInstallFailed(target, error) => {
+                if self.target.as_ref() != Some(target) {
+                    return;
+                }
                 self.installing = None;
                 self.error = Some(format!("安装失败: {}", error.detail));
             }

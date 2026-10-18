@@ -114,6 +114,11 @@ pub struct HilogState {
     pending: String,
     /// 跨块续接的 UTF-8 解码残留。
     utf8: super::Utf8Accumulator,
+    /// 行缓冲每次变化时递增,是可见索引缓存的失效键。
+    data_generation: u64,
+    /// 可见行索引缓存:只在数据/过滤条件变化时重算,避免每帧全量扫描。
+    visible: Vec<usize>,
+    applied_filter: Option<(u64, usize, String)>,
     error: Option<BridgeError>,
     last_start_attempt: Option<Instant>,
 }
@@ -226,6 +231,7 @@ impl HilogState {
             let excess = self.lines.len() - MAX_LINES;
             self.lines.drain(..excess);
         }
+        self.data_generation += 1;
     }
 
     pub fn show(&mut self, ui: &mut Ui, ctx: &PanelCtx) -> Commands {
@@ -267,6 +273,11 @@ impl HilogState {
             if ui.button("清空").clicked() {
                 self.lines.clear();
                 self.pending.clear();
+                // 半个汉字可能正卡在解码残片里,一并重置,避免拼接错位。
+                self.utf8 = super::Utf8Accumulator::new();
+                self.data_generation += 1;
+                self.visible.clear();
+                self.applied_filter = None;
             }
             if ui
                 .add_enabled(ctx.online(), egui::Button::new("清除设备日志"))
@@ -326,26 +337,33 @@ impl HilogState {
         }
         ui.add_space(4.0);
 
-        let min_level = LEVELS[self.level_index];
-        let query = self.query.to_lowercase();
-        let visible: Vec<usize> = self
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| {
-                let level_ok = min_level == '*'
-                    || (line.level != '?' && level_rank(line.level) >= level_rank(min_level));
-                let query_ok = query.is_empty() || line.raw.to_lowercase().contains(&query);
-                level_ok && query_ok
-            })
-            .map(|(index, _)| index)
-            .collect();
+        // 可见索引只在(数据版本, 级别, 查询词)变化时重算;
+        // 万行缓冲 + 关键字过滤不再每帧全量扫描。
+        let filter_key = (self.data_generation, self.level_index, self.query.clone());
+        if self.applied_filter.as_ref() != Some(&filter_key) {
+            let min_level = LEVELS[self.level_index];
+            let query = self.query.to_lowercase();
+            self.visible = self
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let level_ok = min_level == '*'
+                        || (line.level != '?' && level_rank(line.level) >= level_rank(min_level));
+                    let query_ok = query.is_empty() || line.raw.to_lowercase().contains(&query);
+                    level_ok && query_ok
+                })
+                .map(|(index, _)| index)
+                .collect();
+            self.applied_filter = Some(filter_key);
+        }
+        let visible_len = self.visible.len();
 
         let stick = self.auto_scroll;
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .stick_to_bottom(stick)
-            .show_rows(ui, ROW_HEIGHT, visible.len(), |ui, range| {
+            .show_rows(ui, ROW_HEIGHT, visible_len, |ui, range| {
                 let frame = egui::Frame::new()
                     .fill(palette.terminal_bg)
                     .corner_radius(4.0)
@@ -354,7 +372,7 @@ impl HilogState {
                     ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
                     ui.set_min_width(ui.available_width());
                     for index in range {
-                        let Some(buffer_index) = visible.get(index).copied() else {
+                        let Some(buffer_index) = self.visible.get(index).copied() else {
                             continue;
                         };
                         let Some(line) = self.lines.get(buffer_index) else {

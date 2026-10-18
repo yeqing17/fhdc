@@ -27,6 +27,11 @@ enum SortKey {
 pub struct ProcessesState {
     target: Option<DeviceTarget>,
     processes: Vec<ProcessInfo>,
+    /// 进程表每次刷新时递增,是显示缓存的失效键。
+    processes_generation: u64,
+    /// 过滤 + 排序后的显示缓存。
+    display_cache: Vec<ProcessInfo>,
+    display_cache_key: Option<(u64, SortKey, bool, String)>,
     loading: bool,
     error: Option<String>,
     query: String,
@@ -78,6 +83,7 @@ impl ProcessesState {
                     self.loading = false;
                     self.error = None;
                     self.processes = processes.clone();
+                    self.processes_generation += 1;
                 }
             }
             BackendEvent::ProcessesFailed(target, error) => {
@@ -132,35 +138,51 @@ impl ProcessesState {
             return commands;
         }
 
-        let query = self.query.to_lowercase();
-        // 克隆出独立副本,避免排序表的不可变借用与表头排序状态的可变借用冲突。
-        let mut sorted: Vec<ProcessInfo> = self
-            .processes
-            .iter()
-            .filter(|process| {
-                query.is_empty()
-                    || process.command.to_lowercase().contains(&query)
-                    || process.pid.to_string().contains(&query)
-            })
-            .cloned()
-            .collect();
-        sorted.sort_by(|a, b| {
-            let ordering = match self.sort_key {
-                SortKey::Pid => a.pid.cmp(&b.pid),
-                SortKey::Cpu => b
-                    .cpu_percent
-                    .unwrap_or(0.0)
-                    .partial_cmp(&a.cpu_percent.unwrap_or(0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                SortKey::Name => a.command.cmp(&b.command),
-            };
-            if self.sort_descending {
-                ordering.reverse()
-            } else {
-                ordering
-            }
-        });
-
+        // 过滤 + 排序结果缓存:只在(数据版本, 排序键, 方向, 查询词)变化时重算,
+        // 多进程面板不再每帧克隆全表。
+        let display_key = (
+            self.processes_generation,
+            self.sort_key,
+            self.sort_descending,
+            self.query.clone(),
+        );
+        if self.display_cache_key.as_ref() != Some(&display_key) {
+            let query = self.query.to_lowercase();
+            let mut display: Vec<ProcessInfo> = self
+                .processes
+                .iter()
+                .filter(|process| {
+                    query.is_empty()
+                        || process.command.to_lowercase().contains(&query)
+                        || process.pid.to_string().contains(&query)
+                })
+                .cloned()
+                .collect();
+            let sort_key = self.sort_key;
+            let sort_descending = self.sort_descending;
+            display.sort_by(|a, b| {
+                let ordering = match sort_key {
+                    SortKey::Pid => a.pid.cmp(&b.pid),
+                    SortKey::Cpu => b
+                        .cpu_percent
+                        .unwrap_or(0.0)
+                        .partial_cmp(&a.cpu_percent.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                    SortKey::Name => a.command.cmp(&b.command),
+                };
+                if sort_descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+            self.display_cache = display;
+            self.display_cache_key = Some(display_key);
+        }
+        // 行循环借用缓存;排序状态走局部副本,结束后写回。
+        let sorted = &self.display_cache;
+        let mut sort_key = self.sort_key;
+        let mut sort_descending = self.sort_descending;
         let mut kill_target: Option<ProcessInfo> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
@@ -171,13 +193,9 @@ impl ProcessesState {
                     .striped(true)
                     .spacing([18.0, 4.0])
                     .show(ui, |ui| {
-                        let header = |ui: &mut Ui, label: &str, key: SortKey, state: &mut Self| {
-                            let marker = if state.sort_key == key {
-                                if state.sort_descending {
-                                    " ▾"
-                                } else {
-                                    " ▴"
-                                }
+                        let mut header = |ui: &mut Ui, label: &str, key: SortKey| {
+                            let marker = if sort_key == key {
+                                if sort_descending { " ▾" } else { " ▴" }
                             } else {
                                 ""
                             };
@@ -192,24 +210,21 @@ impl ProcessesState {
                                 )
                                 .clicked()
                             {
-                                if state.sort_key == key {
-                                    state.sort_descending = !state.sort_descending;
+                                if sort_key == key {
+                                    sort_descending = !sort_descending;
                                 } else {
-                                    state.sort_key = key;
-                                    state.sort_descending = false;
+                                    sort_key = key;
+                                    sort_descending = false;
                                 }
                             }
                         };
-                        header(ui, "PID", SortKey::Pid, self);
-                        ui.add(
-                            egui::Button::new(egui::RichText::new("用户").weak().small())
-                                .frame(false),
-                        );
-                        header(ui, "CPU%", SortKey::Cpu, self);
-                        header(ui, "命令", SortKey::Name, self);
+                        header(ui, "PID", SortKey::Pid);
+                        ui.label(egui::RichText::new("用户").weak().small());
+                        header(ui, "CPU%", SortKey::Cpu);
+                        header(ui, "命令", SortKey::Name);
                         ui.end_row();
 
-                        for process in &sorted {
+                        for process in sorted {
                             ui.label(egui::RichText::new(process.pid.to_string()).monospace());
                             ui.label(
                                 egui::RichText::new(process.user.as_deref().unwrap_or("—")).small(),
@@ -233,6 +248,9 @@ impl ProcessesState {
                         }
                     });
             });
+        // 写回排序状态;与缓存键不同的话,下一帧会自动重算显示列表。
+        self.sort_key = sort_key;
+        self.sort_descending = sort_descending;
 
         if let Some(process) = kill_target {
             self.kill_prompt = Some(process);

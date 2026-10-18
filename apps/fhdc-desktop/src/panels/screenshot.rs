@@ -125,13 +125,15 @@ impl ScreenshotState {
         }
         ui.add_space(6.0);
 
-        let Some(jpeg) = self.jpeg.clone() else {
+        if self.jpeg.is_none() {
             ui.label(egui::RichText::new("点击「拍照」截取当前屏幕。").weak());
             return commands;
-        };
+        }
 
-        // 解码并缓存纹理(仅在图像更新后重建)。
-        if self.texture.is_none() {
+        // 解码并缓存纹理:只在拿到新图后做一次,此处的 clone 每张图至多一次,
+        // 之后各帧只借用纹理,不再整张拷贝 JPEG。
+        if self.texture.is_none() && self.jpeg.is_some() {
+            let jpeg = self.jpeg.clone().unwrap_or_default();
             match image::load_from_memory(&jpeg) {
                 Ok(dynamic) => {
                     let rgba = dynamic.to_rgba8();

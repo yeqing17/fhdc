@@ -19,8 +19,12 @@ use crate::theme;
 use super::Commands;
 use super::PanelCtx;
 
-/// 回显缓冲上限(字节)。
-const MAX_BUFFER_BYTES: usize = 256 * 1024;
+/// 回显行数上限。
+const MAX_TAIL_LINES: usize = 5000;
+/// 回显字节上限(超限从最旧的行开始丢弃)。
+const MAX_TAIL_BYTES: usize = 256 * 1024;
+/// 回显行高(等宽字体,单行不换行)。
+const TAIL_ROW_HEIGHT: f32 = 16.0;
 /// 输入历史上限。
 const MAX_HISTORY: usize = 64;
 
@@ -38,7 +42,12 @@ pub struct ShellState {
     session: Option<SessionId>,
     status: Status,
     error: Option<BridgeError>,
-    buffer: String,
+    /// 已完成行的回显(只保留尾部,行级虚拟化渲染)。
+    tail: Vec<String>,
+    /// 末尾尚未收到换行的片段:实时回显输入字符。
+    pending_line: String,
+    /// tail 中所有行的字节数,用于超限裁剪。
+    tail_bytes: usize,
     /// 跨块续接的 UTF-8 解码残留。
     utf8: super::Utf8Accumulator,
     input: String,
@@ -57,7 +66,9 @@ impl ShellState {
             session: None,
             status: Status::Disconnected,
             error: None,
-            buffer: String::new(),
+            tail: Vec::new(),
+            pending_line: String::new(),
+            tail_bytes: 0,
             utf8: super::Utf8Accumulator::new(),
             input: String::new(),
             history: Vec::new(),
@@ -88,7 +99,7 @@ impl ShellState {
         self.target = target;
         self.status = Status::Disconnected;
         self.error = None;
-        self.buffer.clear();
+        self.clear_display();
         self.utf8 = super::Utf8Accumulator::new();
         self.input.clear();
         self.history_cursor = None;
@@ -159,15 +170,41 @@ impl ShellState {
         // 先经增量解码器续接跨块的汉字,再做 ANSI 清洗。
         let text = self.utf8.push(bytes);
         let cleaned = strip_ansi(&text);
-        self.buffer.push_str(&cleaned);
-        if self.buffer.len() > MAX_BUFFER_BYTES {
-            // 超限时丢掉前半,保留后半,并对齐 UTF-8 字符边界。
-            let mut cut = self.buffer.len() - MAX_BUFFER_BYTES / 2;
-            while !self.buffer.is_char_boundary(cut) {
-                cut += 1;
-            }
-            let _ = self.buffer.drain(..cut);
+        // 按行切分:首段并入未换行残留成为完整行,末段成为新的残留。
+        let mut split = cleaned.split('\n');
+        let remainder = split.next_back().unwrap_or_default().to_owned();
+        for line in split {
+            self.pending_line.push_str(line);
+            let complete = std::mem::take(&mut self.pending_line);
+            self.tail_bytes += complete.len() + 1;
+            self.tail.push(complete);
         }
+        self.pending_line.push_str(&remainder);
+        // 超限时从最旧的行开始丢弃。
+        while self.tail.len() > MAX_TAIL_LINES
+            || (self.tail_bytes > MAX_TAIL_BYTES && self.tail.len() > 1)
+        {
+            let dropped = self.tail.remove(0);
+            self.tail_bytes -= dropped.len() + 1;
+        }
+    }
+
+    fn clear_display(&mut self) {
+        self.tail.clear();
+        self.pending_line.clear();
+        self.tail_bytes = 0;
+    }
+
+    /// 完整回显文本(复制全部用)。
+    fn display_text(&self) -> String {
+        let mut text = self.tail.join("\n");
+        if !self.pending_line.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&self.pending_line);
+        }
+        text
     }
 
     fn send_line(&mut self) -> Option<BackendCommand> {
@@ -240,10 +277,10 @@ impl ShellState {
                 }
             }
             if ui.button("清屏").clicked() {
-                self.buffer.clear();
+                self.clear_display();
             }
             if ui.button("复制全部").clicked() {
-                ui.ctx().copy_text(self.buffer.clone());
+                ui.ctx().copy_text(self.display_text());
             }
         });
         if let Some(error) = &self.error {
@@ -262,33 +299,45 @@ impl ShellState {
         self.quick.show_manage(ui);
         ui.add_space(4.0);
 
-        // 回显区
+        // 回显区:行级虚拟化,只为可见行生成部件,长日志不再整块重排。
         let palette_terminal = theme::palette(ui.visuals().dark_mode);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, true])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                let frame = egui::Frame::new()
-                    .fill(palette_terminal.terminal_bg)
-                    .corner_radius(4.0)
-                    .inner_margin(8.0);
-                frame.show(ui, |ui| {
-                    ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-                    ui.set_min_width(ui.available_width());
-                    if self.buffer.is_empty() {
-                        ui.label(
-                            egui::RichText::new(if ctx.online() {
-                                "等待输出…"
-                            } else {
-                                "选择设备并点击「连接」"
-                            })
-                            .weak(),
-                        );
+        let frame = egui::Frame::new()
+            .fill(palette_terminal.terminal_bg)
+            .corner_radius(4.0)
+            .inner_margin(8.0);
+        frame.show(ui, |ui| {
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            let total_rows = self.tail.len() + usize::from(!self.pending_line.is_empty());
+            if total_rows == 0 {
+                ui.set_min_height(160.0);
+                ui.label(
+                    egui::RichText::new(if ctx.online() {
+                        "等待输出…"
                     } else {
-                        ui.label(self.buffer.clone());
-                    }
-                });
-            });
+                        "选择设备并点击「连接」"
+                    })
+                    .weak(),
+                );
+            } else {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .stick_to_bottom(true)
+                    .show_rows(ui, TAIL_ROW_HEIGHT, total_rows, |ui, range| {
+                        ui.set_min_width(ui.available_width());
+                        for index in range {
+                            let text = if index < self.tail.len() {
+                                self.tail[index].as_str()
+                            } else {
+                                self.pending_line.as_str()
+                            };
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(text))
+                                    .wrap_mode(egui::TextWrapMode::Truncate),
+                            );
+                        }
+                    });
+            }
+        });
 
         ui.add_space(4.0);
         // 输入行

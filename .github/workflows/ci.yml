@@ -5,6 +5,10 @@ on:
     branches: [master]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -21,10 +25,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy(零警告)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: 测试
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Release 构建
-        run: cargo build --release -p fhdc
+        run: cargo build --release -p fhdc --locked

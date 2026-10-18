@@ -36,7 +36,7 @@ cargo run --release -p fhdc
 
 或直接使用已构建的 `target/release/fhdc.exe`。
 
-**hdc 查找顺序:** `FHDC_HDC` 环境变量 → 设置中的手动路径 → `HDC_HOME` / `OHOS_SDK_HOME` / `DEVECO_SDK_HOME` → DevEco Studio 默认安装位置 → `PATH`。找不到时自动退回内置假后端(界面完整可用,数据为演示数据),并在设置中提示。
+**hdc 查找顺序:** `FHDC_HDC` 环境变量 → 设置中的手动路径 → `HDC_HOME` / `OHOS_SDK_HOME` / `DEVECO_SDK_HOME` → DevEco Studio 默认安装位置 → `PATH`。找不到时自动退回内置假后端(界面完整可用,数据为演示数据),并在顶栏提示。
 
 **无设备体验界面:**
 

@@ -45,6 +45,10 @@ pub struct FilesState {
     error: Option<BridgeError>,
     sort_key: SortKey,
     sort_descending: bool,
+    /// 排序结果缓存:只在(列表版本, 排序键, 方向)变化时重算。
+    sorted_cache: Vec<RemoteFileEntry>,
+    sort_cache_key: Option<(u64, SortKey, bool)>,
+    entries_generation: u64,
     transfers: Vec<ActiveTransfer>,
     /// 进行中的上传,用于"已存在→替换?"重试。
     active_uploads: HashMap<OperationId, (PathBuf, RemotePath)>,
@@ -65,6 +69,8 @@ impl FilesState {
         self.target = target;
         self.path = None;
         self.entries.clear();
+        self.sorted_cache.clear();
+        self.sort_cache_key = None;
         self.error = None;
         self.loading = false;
         self.transfers.clear();
@@ -117,6 +123,7 @@ impl FilesState {
                     self.error = None;
                     if self.path.as_ref() == Some(path) {
                         self.entries = entries.clone();
+                        self.entries_generation += 1;
                     }
                 }
             }
@@ -272,9 +279,19 @@ impl FilesState {
             });
         }
 
-        // 列表
-        let mut sorted = self.entries.clone();
-        sort_entries(&mut sorted, self.sort_key, self.sort_descending);
+        // 列表:排序结果缓存,大目录不再每帧克隆重排。
+        let sort_key_tuple = (self.entries_generation, self.sort_key, self.sort_descending);
+        if self.sort_cache_key != Some(sort_key_tuple) {
+            let mut sorted = self.entries.clone();
+            sort_entries(&mut sorted, self.sort_key, self.sort_descending);
+            self.sorted_cache = sorted;
+            self.sort_cache_key = Some(sort_key_tuple);
+        }
+        // 行循环直接借用缓存;排序状态用局部副本驱动表头,
+        // 结束后一次性写回,避免闭包交叉借用 self。
+        let sorted = &self.sorted_cache;
+        let mut sort_key = self.sort_key;
+        let mut sort_descending = self.sort_descending;
         let mut enter: Option<RemotePath> = None;
         let mut download: Option<RemoteFileEntry> = None;
         let mut delete: Option<RemoteFileEntry> = None;
@@ -290,8 +307,8 @@ impl FilesState {
                     .spacing([18.0, 4.0])
                     .show(ui, |ui| {
                         let mut header = |ui: &mut Ui, label: &str, key: SortKey| {
-                            let marker = if self.sort_key == key {
-                                if self.sort_descending { " ▾" } else { " ▴" }
+                            let marker = if sort_key == key {
+                                if sort_descending { " ▾" } else { " ▴" }
                             } else {
                                 ""
                             };
@@ -306,25 +323,22 @@ impl FilesState {
                                 )
                                 .clicked()
                             {
-                                if self.sort_key == key {
-                                    self.sort_descending = !self.sort_descending;
+                                if sort_key == key {
+                                    sort_descending = !sort_descending;
                                 } else {
-                                    self.sort_key = key;
-                                    self.sort_descending = false;
+                                    sort_key = key;
+                                    sort_descending = false;
                                 }
                             }
                         };
                         header(ui, "名称", SortKey::Name);
-                        // 类型列不支持排序,用普通弱化表头,避免误绑排序键。
-                        ui.add(
-                            egui::Button::new(egui::RichText::new("类型").weak().small())
-                                .frame(false),
-                        );
+                        // 类型列不支持排序,普通弱化文本即可(不该有可点的假象)。
+                        ui.label(egui::RichText::new("类型").weak().small());
                         header(ui, "大小", SortKey::Size);
                         header(ui, "修改时间", SortKey::Modified);
                         ui.end_row();
 
-                        for entry in &sorted {
+                        for entry in sorted {
                             let icon = match entry.kind {
                                 RemoteFileKind::Directory => "📁",
                                 RemoteFileKind::File => "📄",
@@ -394,7 +408,11 @@ impl FilesState {
                         }
                     });
             });
-        if sorted.is_empty() && !self.loading {
+        // 写回排序状态;与缓存键不同的话,下一帧会自动重算排序列表。
+        // (此后不再借用 sorted,避免与可变写回冲突。)
+        self.sort_key = sort_key;
+        self.sort_descending = sort_descending;
+        if self.sorted_cache.is_empty() && !self.loading {
             ui.label(egui::RichText::new("(空目录)").weak());
         }
 

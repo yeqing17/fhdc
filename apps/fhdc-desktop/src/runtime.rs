@@ -100,6 +100,13 @@ async fn send_event(tx: &mpsc::Sender<BackendEvent>, context: &Context, event: B
     }
 }
 
+/// 后台任务完成回执:传输收尾或设备发现结果。
+enum Completion {
+    Transfer(OperationId),
+    /// 发现任务完成;Err 时保留上一次快照,不清空设备列表。
+    Discovered(Result<Vec<fhdc_domain::DeviceDescriptor>, BridgeError>),
+}
+
 async fn run_backend(
     mut command_rx: mpsc::Receiver<BackendCommand>,
     event_tx: mpsc::Sender<BackendEvent>,
@@ -115,21 +122,67 @@ async fn run_backend(
     let sessions: Arc<Mutex<HashMap<SessionId, CancellationToken>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut transfers: HashMap<OperationId, CancellationToken> = HashMap::new();
-    let (done_tx, mut done_rx) = mpsc::channel::<OperationId>(64);
-    let mut discovery_tick = tokio::time::interval(DEVICE_POLL_INTERVAL);
+    let (done_tx, mut done_rx) = mpsc::channel::<Completion>(64);
+    // interval 首个 tick 立即就绪;显式推迟一个周期,避免启动时背靠背两次发现。
+    let mut discovery_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + DEVICE_POLL_INTERVAL,
+        DEVICE_POLL_INTERVAL,
+    );
+    let mut discovery_healthy = true;
+    let mut last_broadcast: Option<fhdc_domain::DeviceSnapshot> = None;
 
-    refresh_devices(&transport, &mut registry, &event_tx, &context).await;
+    // 启动时的第一次发现。
+    spawn_discovery(&transport, &done_tx);
+    let mut discovery_in_flight = true;
 
     loop {
         let command = tokio::select! {
-            // 周期性设备发现:插拔设备无需手动刷新。
+            // 周期性设备发现:插拔设备无需手动刷新。发现本身在后台任务里
+            // 执行,hdc 卡住时也不会堵住命令队列(最多同时挂一个)。
             _ = discovery_tick.tick() => {
-                refresh_devices(&transport, &mut registry, &event_tx, &context).await;
+                if !discovery_in_flight {
+                    discovery_in_flight = true;
+                    spawn_discovery(&transport, &done_tx);
+                }
                 continue;
             }
             done = done_rx.recv() => {
-                if let Some(operation) = done {
-                    transfers.remove(&operation);
+                let Some(completion) = done else { break };
+                match completion {
+                    Completion::Transfer(operation) => {
+                        transfers.remove(&operation);
+                    }
+                    Completion::Discovered(result) => {
+                        discovery_in_flight = false;
+                        match result {
+                            Ok(descriptors) => {
+                                discovery_healthy = true;
+                                let snapshot = registry.reconcile(descriptors);
+                                broadcast_if_changed(
+                                    &event_tx,
+                                    &context,
+                                    &mut last_broadcast,
+                                    snapshot,
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                // 边沿触发:只在"由好变坏"时报一次错,
+                                // 否则轮询会让错误条每 2 秒复活一次。
+                                if discovery_healthy {
+                                    discovery_healthy = false;
+                                    send_event(
+                                        &event_tx,
+                                        &context,
+                                        BackendEvent::OperationFailed(error),
+                                    )
+                                    .await;
+                                } else {
+                                    tracing::warn!("设备发现失败(持续): {}", error.detail);
+                                }
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -141,11 +194,14 @@ async fn run_backend(
 
         match command {
             BackendCommand::RefreshDevices => {
-                refresh_devices(&transport, &mut registry, &event_tx, &context).await;
+                if !discovery_in_flight {
+                    discovery_in_flight = true;
+                    spawn_discovery(&transport, &done_tx);
+                }
             }
             BackendCommand::SelectDevice { key } => match registry.select(key) {
                 Ok(snapshot) => {
-                    send_event(&event_tx, &context, BackendEvent::DevicesChanged(snapshot)).await
+                    broadcast_if_changed(&event_tx, &context, &mut last_broadcast, snapshot).await
                 }
                 Err(error) => {
                     send_event(&event_tx, &context, BackendEvent::OperationFailed(error)).await
@@ -656,7 +712,7 @@ async fn run_backend(
                             .push_file(&target.key, &local, &remote, overwrite, &token)
                             .await;
                         send_event(&event_tx, &context, transfer_event(operation, result)).await;
-                        let _ = done_tx.send(operation).await;
+                        let _ = done_tx.send(Completion::Transfer(operation)).await;
                     });
                 } else {
                     send_event(
@@ -700,7 +756,7 @@ async fn run_backend(
                             .pull_file(&target.key, &remote, &local, overwrite, &token)
                             .await;
                         send_event(&event_tx, &context, transfer_event(operation, result)).await;
-                        let _ = done_tx.send(operation).await;
+                        let _ = done_tx.send(Completion::Transfer(operation)).await;
                     });
                 } else {
                     send_event(
@@ -922,21 +978,28 @@ fn ensure_target(registry: &DeviceRegistry, target: &DeviceTarget) -> bool {
     registry.current_online(target).is_some()
 }
 
-async fn refresh_devices(
-    transport: &Arc<dyn HdcTransport>,
-    registry: &mut DeviceRegistry,
+/// 后台执行一次设备发现,结果经完成通道回到主循环。
+fn spawn_discovery(transport: &Arc<dyn HdcTransport>, done_tx: &mpsc::Sender<Completion>) {
+    let transport = Arc::clone(transport);
+    let done_tx = done_tx.clone();
+    tokio::spawn(async move {
+        let result = transport.list_devices().await;
+        let _ = done_tx.send(Completion::Discovered(result)).await;
+    });
+}
+
+/// 快照与上次广播相同则跳过:省掉每 2 秒一次的无谓重绘与事件。
+async fn broadcast_if_changed(
     event_tx: &mpsc::Sender<BackendEvent>,
     context: &Context,
+    last_broadcast: &mut Option<fhdc_domain::DeviceSnapshot>,
+    snapshot: fhdc_domain::DeviceSnapshot,
 ) {
-    match transport.list_devices().await {
-        Ok(descriptors) => {
-            let snapshot = registry.reconcile(descriptors);
-            send_event(event_tx, context, BackendEvent::DevicesChanged(snapshot)).await;
-        }
-        Err(error) => {
-            send_event(event_tx, context, BackendEvent::OperationFailed(error)).await;
-        }
+    if last_broadcast.as_ref() == Some(&snapshot) {
+        return;
     }
+    *last_broadcast = Some(snapshot.clone());
+    send_event(event_tx, context, BackendEvent::DevicesChanged(snapshot)).await;
 }
 
 /// 决定使用真实 hdc 还是假后端;环境变量 FHDC_FAKE=1 强制假后端。

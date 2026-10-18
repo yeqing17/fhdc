@@ -362,26 +362,38 @@ impl HdcTransport for ProcessHdcTransport {
     }
 
     async fn device_overview(&self, key: &ConnectKey) -> Result<DeviceOverview, BridgeError> {
-        let cpu_cores = self
-            .probe(key, "grep -c '^processor' /proc/cpuinfo")
-            .await
-            .and_then(|v| v.parse().ok());
-        let meminfo = self
-            .probe(key, "cat /proc/meminfo")
-            .await
-            .unwrap_or_default();
-        let (memory_total_kib, memory_available_kib) = parse_meminfo(&meminfo);
-        let df = self.probe(key, "df -k /data").await.unwrap_or_default();
-        let (storage_total_kib, storage_used_kib) = parse_df_data(&df);
+        // 十条探测并发执行:总耗时从 10 次往返压缩到约 1 次。
+        let (
+            model,
+            brand,
+            device_type,
+            software_version,
+            api_version,
+            kernel_version,
+            cores,
+            meminfo,
+            df,
+        ) = tokio::join!(
+            self.probe(key, "param get const.product.model"),
+            self.probe(key, "param get const.product.brand"),
+            self.probe(key, "param get const.product.devicetype"),
+            self.probe(key, "param get const.product.software.version"),
+            self.probe(key, "param get const.ohos.apiversion"),
+            self.probe(key, "uname -r"),
+            self.probe(key, "grep -c '^processor' /proc/cpuinfo"),
+            self.probe(key, "cat /proc/meminfo"),
+            self.probe(key, "df -k /data"),
+        );
+        let cpu_cores = cores.and_then(|value| value.parse().ok());
+        let (memory_total_kib, memory_available_kib) = parse_meminfo(&meminfo.unwrap_or_default());
+        let (storage_total_kib, storage_used_kib) = parse_df_data(&df.unwrap_or_default());
         Ok(DeviceOverview {
-            model: self.probe(key, "param get const.product.model").await,
-            brand: self.probe(key, "param get const.product.brand").await,
-            device_type: self.probe(key, "param get const.product.devicetype").await,
-            software_version: self
-                .probe(key, "param get const.product.software.version")
-                .await,
-            api_version: self.probe(key, "param get const.ohos.apiversion").await,
-            kernel_version: self.probe(key, "uname -r").await,
+            model,
+            brand,
+            device_type,
+            software_version,
+            api_version,
+            kernel_version,
             cpu_cores,
             memory_total_kib,
             memory_available_kib,
