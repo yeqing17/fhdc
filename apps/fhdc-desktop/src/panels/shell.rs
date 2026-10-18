@@ -609,13 +609,13 @@ mod tests {
         // 分片 8KB)必须照常清洗,不能整段按字面量放行。
         let mut pending = String::new();
         let mut big = String::new();
-        for _ in 0..600 {
+        for _ in 0..700 {
             big.push_str("\x1b[32mA\x1b[0m\r\n");
         }
-        assert!(big.len() > 8192 / 2);
+        assert!(big.len() >= 8192, "输入必须不小于真实的单块分片 8KB");
         let cleaned = strip_ansi_stream(&mut pending, &big);
-        assert_eq!(cleaned.matches('A').count(), 600);
-        assert_eq!(cleaned.matches('\n').count(), 600);
+        assert_eq!(cleaned.matches('A').count(), 700);
+        assert_eq!(cleaned.matches('\n').count(), 700);
         assert!(!cleaned.contains('\x1b'));
         assert!(!cleaned.contains('\r'));
         assert!(pending.is_empty());

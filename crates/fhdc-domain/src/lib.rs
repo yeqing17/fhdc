@@ -433,10 +433,30 @@ pub struct ShellOutputChunk {
 }
 
 // ---------------------------------------------------------------------------
+// 应用更新
+// ---------------------------------------------------------------------------
+
+/// 一次可用更新的元数据;asset 缺失时降级为纯链接。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateInfo {
+    pub version: String,
+    pub url: String,
+    pub asset_url: Option<String>,
+    pub asset_size: Option<u64>,
+    pub checksum_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateCheckOutcome {
+    UpToDate,
+    Available(UpdateInfo),
+}
+
+// ---------------------------------------------------------------------------
 // 后端命令(UI → 后端)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BackendCommand {
     RefreshDevices,
     SelectDevice {
@@ -517,6 +537,9 @@ pub enum BackendCommand {
         target: DeviceTarget,
         path: RemotePath,
     },
+    CheckForUpdates,
+    DownloadUpdate,
+    CancelUpdateDownload,
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +674,12 @@ pub enum BackendEvent {
         kind: FileMutationKind,
         error: BridgeError,
     },
+    UpdateChecked(Result<UpdateCheckOutcome, BridgeError>),
+    UpdateDownloadProgress {
+        received: u64,
+        total: Option<u64>,
+    },
+    UpdateDownloadFinished(Result<(), BridgeError>),
     OperationFailed(BridgeError),
 }
 

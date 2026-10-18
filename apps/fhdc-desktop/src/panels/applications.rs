@@ -54,6 +54,11 @@ impl AppsState {
         self.loading = false;
     }
 
+    /// 供上层在命令发送失败时回收乐观置位的加载状态。
+    pub fn reset_loading(&mut self) {
+        self.loading = false;
+    }
+
     pub fn maybe_auto_load(&mut self, ctx: &PanelCtx) -> Option<BackendCommand> {
         if !ctx.online() || self.loading || !self.bundles.is_empty() {
             return None;

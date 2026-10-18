@@ -101,6 +101,21 @@ struct Toast {
     until: Instant,
 }
 
+/// 设置页「更新」区与自升级流程的 UI 状态。
+#[derive(Default)]
+struct UpdateState {
+    checking: bool,
+    /// 最近一次检查是否由用户主动发起(决定失败是否展示)。
+    user_check: bool,
+    auto_checked: bool,
+    outcome: Option<Result<fhdc_domain::UpdateCheckOutcome, BridgeError>>,
+    downloading: bool,
+    progress: Option<(u64, Option<u64>)>,
+    /// 新版已下载并暂存,等用户点「重启并安装」。
+    staged_ready: bool,
+    error: Option<String>,
+}
+
 #[derive(Default)]
 struct WindowFlags {
     manager: bool,
@@ -131,6 +146,7 @@ pub struct FhdcApp {
     endpoint_input: String,
     listen_port: String,
     pending_select: Option<(ConnectKey, Instant)>,
+    update: UpdateState,
 }
 
 impl FhdcApp {
@@ -191,6 +207,7 @@ impl FhdcApp {
             endpoint_input: String::new(),
             listen_port: "5555".to_owned(),
             pending_select: None,
+            update: UpdateState::default(),
         };
         app.apply_theme(&creation_context.egui_ctx);
         app
@@ -220,7 +237,17 @@ impl FhdcApp {
     }
 
     fn send(&mut self, command: BackendCommand) {
-        self.runtime.try_send(command);
+        if !self.runtime.try_send(command.clone()) {
+            // 命令队列满被丢弃:三个"发送前置位 loading"的面板按钮此刻
+            // 是禁用的,不回滚会永久卡在加载态。此处集中回收。
+            match &command {
+                BackendCommand::LoadOverview(_) => self.overview.reset_loading(),
+                BackendCommand::LoadBundles(_) => self.apps.reset_loading(),
+                BackendCommand::CaptureScreenshot(_) => self.screenshot.reset_loading(),
+                _ => {}
+            }
+            self.show_toast("操作繁忙,命令未被发送,请稍后重试");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -257,6 +284,32 @@ impl FhdcApp {
                 self.apply_snapshot(snapshot);
             }
             BackendEvent::Toast(message) => self.show_toast(message),
+            BackendEvent::UpdateChecked(outcome) => {
+                self.update.checking = false;
+                if let Ok(fhdc_domain::UpdateCheckOutcome::Available(ref info)) = outcome {
+                    // 无论手动还是自动检查,发现新版本都值得提示一次。
+                    self.show_toast(format!("发现新版本 {},到 设置 → 关于 下载", info.version));
+                }
+                self.update.outcome = Some(outcome);
+            }
+            BackendEvent::UpdateDownloadProgress { received, total } => {
+                self.update.progress = Some((received, total));
+            }
+            BackendEvent::UpdateDownloadFinished(result) => {
+                self.update.downloading = false;
+                self.update.progress = None;
+                match result {
+                    Ok(()) => {
+                        self.update.staged_ready = true;
+                        self.update.error = None;
+                        self.show_toast("新版本已就绪,到 设置 → 关于 重启安装");
+                    }
+                    Err(error) => {
+                        self.update.staged_ready = false;
+                        self.update.error = Some(error.detail.clone());
+                    }
+                }
+            }
             BackendEvent::EndpointConnectFinished { endpoint, message } => {
                 self.show_toast(format!("连接成功: {message}"));
                 self.remember_endpoint(endpoint.clone());
@@ -358,6 +411,13 @@ impl FhdcApp {
     // ------------------------------------------------------------------
 
     fn auto_behaviors(&mut self, context: &Context) {
+        // 后端就绪后静默检查一次更新;失败不打扰(手动检查才展示错误)。
+        if !self.update.auto_checked && self.hdc_ready.is_some() {
+            self.update.auto_checked = true;
+            self.update.user_check = false;
+            self.update.checking = true;
+            self.send(BackendCommand::CheckForUpdates);
+        }
         let ctx = self.panel_ctx();
         // 选中变化后的概览加载
         if let Some(command) = (self.overview.wants_load(&ctx))
@@ -834,6 +894,8 @@ impl FhdcApp {
                         ui.end_row();
                     });
                 ui.separator();
+                self.update_section(ui);
+                ui.separator();
                 if ui.button("关闭").clicked() {
                     close = true;
                 }
@@ -855,6 +917,94 @@ impl FhdcApp {
         }
         if close {
             self.windows.settings = false;
+        }
+    }
+
+    /// 设置页的「更新」区:检查 → 下载(进度/取消)→ 重启安装。
+    fn update_section(&mut self, ui: &mut Ui) {
+        ui.label(egui::RichText::new("更新").strong());
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let check_label = if self.update.checking {
+                "检查中…"
+            } else {
+                "检查更新"
+            };
+            if ui
+                .add_enabled(
+                    !self.update.checking && !self.update.downloading,
+                    egui::Button::new(check_label),
+                )
+                .clicked()
+            {
+                self.update.user_check = true;
+                self.update.checking = true;
+                self.update.error = None;
+                self.send(BackendCommand::CheckForUpdates);
+            }
+            if self.update.checking {
+                ui.spinner();
+            }
+        });
+        match self.update.outcome.clone() {
+            Some(Ok(fhdc_domain::UpdateCheckOutcome::UpToDate)) => {
+                ui.label(egui::RichText::new("已是最新版本。").weak());
+            }
+            Some(Ok(fhdc_domain::UpdateCheckOutcome::Available(info))) => {
+                ui.label(format!("新版本 {} 可用。", info.version));
+                if info.asset_url.is_some() {
+                    if !self.update.downloading
+                        && !self.update.staged_ready
+                        && ui.button("下载并安装").clicked()
+                    {
+                        self.update.downloading = true;
+                        self.update.error = None;
+                        self.send(BackendCommand::DownloadUpdate);
+                    }
+                    if self.update.downloading {
+                        ui.horizontal(|ui| {
+                            let (received, total) =
+                                self.update.progress.unwrap_or((0, info.asset_size));
+                            let fraction = total
+                                .filter(|total| *total > 0)
+                                .map(|total| received as f32 / total as f32)
+                                .unwrap_or(0.0);
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .show_percentage()
+                                    .desired_width(220.0),
+                            );
+                            if ui.button("取消").clicked() {
+                                self.send(BackendCommand::CancelUpdateDownload);
+                            }
+                        });
+                        ui.ctx().request_repaint_after(Duration::from_millis(120));
+                    }
+                    if self.update.staged_ready && ui.button("重启并安装").clicked() {
+                        // 成功的换名不会返回:新进程已接管。
+                        if let Err(error) = apply_pending_update() {
+                            self.update.error = Some(error);
+                        }
+                    }
+                } else if !info.url.is_empty() {
+                    ui.hyperlink_to("打开发布页手动下载", &info.url);
+                }
+            }
+            Some(Err(error)) => {
+                // 自动检查的失败保持安静,只在用户主动检查时展示。
+                if self.update.user_check {
+                    ui.colored_label(
+                        theme::palette(ui.visuals().dark_mode).error,
+                        error.detail.clone(),
+                    );
+                }
+            }
+            None => {
+                ui.label(egui::RichText::new("尚未检查更新。").weak());
+            }
+        }
+        if let Some(error) = &self.update.error {
+            ui.colored_label(theme::palette(ui.visuals().dark_mode).error, error.clone());
         }
     }
 
@@ -914,6 +1064,36 @@ impl eframe::App for FhdcApp {
 }
 
 /// 视口配置(供 main.rs 使用)。
+/// 把暂存的更新换到当前可执行文件名上并重启。
+///
+/// Windows 不允许覆盖运行中的 exe、但允许改名,所以舞步是:
+/// 运行中 → `.old`,暂存的 `.new` → 原名,拉起新进程,退出。
+/// `main` 在下次启动时清理残留的 `.old`。任一步失败都会恢复原布局,
+/// 程序就地继续可用。
+fn apply_pending_update() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let staged = crate::runtime::staged_update_path(&exe);
+    if !staged.exists() {
+        return Err("暂存的更新不存在,请重新下载".to_owned());
+    }
+    let backup = exe.with_extension("exe.old");
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(&exe, &backup).map_err(|error| format!("无法移开当前程序: {error}"))?;
+    if let Err(error) = std::fs::rename(&staged, &exe) {
+        let _ = std::fs::rename(&backup, &exe);
+        return Err(format!("无法放入新版本: {error}"));
+    }
+    match std::process::Command::new(&exe).spawn() {
+        Ok(_) => std::process::exit(0),
+        Err(error) => {
+            // 换回旧二进制;暂存的新版保留,可再试一次。
+            let _ = std::fs::rename(&exe, &staged);
+            let _ = std::fs::rename(&backup, &exe);
+            Err(format!("无法启动新版本: {error}"))
+        }
+    }
+}
+
 pub fn viewport_builder() -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title("fhdc — 鸿蒙调试工具箱")

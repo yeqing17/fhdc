@@ -46,6 +46,11 @@ impl ScreenshotState {
         self.loading = false;
     }
 
+    /// 供上层在命令发送失败时回收乐观置位的加载状态。
+    pub fn reset_loading(&mut self) {
+        self.loading = false;
+    }
+
     pub fn handle_event(&mut self, event: &BackendEvent) {
         match event {
             BackendEvent::ScreenshotLoading(target) => {

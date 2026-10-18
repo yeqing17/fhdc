@@ -13,6 +13,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
+repository = "https://github.com/yeqing17/fhdc"
 
 [workspace.dependencies]
 fhdc-domain = { path = "crates/fhdc-domain" }
@@ -32,6 +33,10 @@ tokio-util = { version = "0.7.18", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 uuid = { version = "1.24.0", features = ["v4"] }
+semver = "1.0.28"
+sha2 = "0.10.9"
+# "system-proxy" 读取系统代理设置,自升级下载才能走用户配置的代理。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "system-proxy"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

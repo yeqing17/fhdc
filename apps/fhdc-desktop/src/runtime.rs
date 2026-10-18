@@ -71,17 +71,23 @@ impl RuntimeBridge {
     }
 
     /// 发送命令;WriteShell 直接路由到会话输入通道。
-    pub fn try_send(&self, command: BackendCommand) {
+    /// 返回是否送达,调用方可据此回收乐观置位的状态。
+    pub fn try_send(&self, command: BackendCommand) -> bool {
         if let BackendCommand::WriteShell { session, input } = &command {
             let guard = self.shell_inputs.read().unwrap();
             if let Some(sender) = guard.get(session) {
                 let _ = sender.try_send(input.clone());
-                return;
+                return true;
             }
             tracing::debug!(?session, "WriteShell 被丢弃:会话已关闭或尚未注册");
+            return false;
         }
-        if self.command_tx.try_send(command).is_err() {
-            tracing::warn!("后端命令队列已满,命令被丢弃");
+        match self.command_tx.try_send(command) {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::warn!("后端命令队列已满,命令被丢弃");
+                false
+            }
         }
     }
 
@@ -135,6 +141,9 @@ async fn run_backend(
     let mut last_broadcast: Option<fhdc_domain::DeviceSnapshot> = None;
     // 发现进行中收到的刷新请求:结束后补跑一次,不静默丢弃。
     let mut rediscover_requested = false;
+    // 自升级:进行中的下载令牌 + 最近一次检查到的更新信息。
+    let update_download: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let last_update_info: Arc<Mutex<Option<fhdc_domain::UpdateInfo>>> = Arc::new(Mutex::new(None));
 
     // 启动时的第一次发现。
     spawn_discovery(&transport, &done_tx);
@@ -855,6 +864,55 @@ async fn run_backend(
                 )
                 .await;
             }
+            BackendCommand::CheckForUpdates => {
+                let event_tx = event_tx.clone();
+                let context = context.clone();
+                let last_info = Arc::clone(&last_update_info);
+                tokio::spawn(async move {
+                    let outcome = check_for_update().await;
+                    if let Ok(fhdc_domain::UpdateCheckOutcome::Available(ref info)) = outcome {
+                        *last_info.lock().unwrap() = Some(info.clone());
+                    }
+                    send_event(&event_tx, &context, BackendEvent::UpdateChecked(outcome)).await;
+                });
+            }
+            BackendCommand::DownloadUpdate => {
+                // 同一时间只允许一个下载任务;信息来自最近一次成功检查。
+                if update_download
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|token| !token.is_cancelled())
+                {
+                    continue;
+                }
+                let Some(info) = last_update_info.lock().unwrap().clone() else {
+                    send_event(
+                        &event_tx,
+                        &context,
+                        BackendEvent::UpdateDownloadFinished(Err(BridgeError::new(
+                            ErrorCode::Internal,
+                            "没有可用的更新信息,请先检查更新",
+                        ))),
+                    )
+                    .await;
+                    continue;
+                };
+                let cancel = CancellationToken::new();
+                *update_download.lock().unwrap() = Some(cancel.clone());
+                let event_tx = event_tx.clone();
+                let context = context.clone();
+                let slot = Arc::clone(&update_download);
+                tokio::spawn(async move {
+                    download_update(info, event_tx, context, cancel).await;
+                    slot.lock().unwrap().take();
+                });
+            }
+            BackendCommand::CancelUpdateDownload => {
+                if let Some(token) = update_download.lock().unwrap().take() {
+                    token.cancel();
+                }
+            }
         }
     }
 }
@@ -1143,5 +1201,358 @@ pub fn app_action_label(action: AppAction) -> &'static str {
         AppAction::ForceStop => "强制停止",
         AppAction::ClearData => "清除数据",
         AppAction::Uninstall => "卸载",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 应用自升级(仿照 fadb:GitHub Releases 检查 → 校验下载 → 换名重启)
+// ---------------------------------------------------------------------------
+
+/// GitHub Releases API;`/releases/latest` 自动跳过草稿与预发布。
+const RELEASES_API_URL: &str = "https://api.github.com/repos/yeqing17/fhdc/releases/latest";
+const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const UPDATE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// 发布清单里标识"本平台裸 exe"的资源名后缀(自升级直接下载它)。
+#[cfg(windows)]
+const UPDATE_BINARY_SUFFIX: Option<&str> = Some("x86_64-pc-windows-msvc.exe");
+#[cfg(not(windows))]
+const UPDATE_BINARY_SUFFIX: Option<&str> = None;
+const UPDATE_CHECKSUM_SUFFIX: &str = "SHA256SUMS.txt";
+
+/// 查询 GitHub 最新发布并与当前构建比较。
+/// reqwest 走系统代理设置,用户挂代理时与浏览器同路;任何失败
+/// (离线、被墙、限流)都降级为可展示的 BridgeError。
+async fn check_for_update() -> Result<fhdc_domain::UpdateCheckOutcome, BridgeError> {
+    let failure = |error: reqwest::Error| {
+        BridgeError::new(ErrorCode::Internal, format!("检查更新失败: {error}"))
+    };
+    let client = reqwest::Client::builder()
+        .timeout(UPDATE_HTTP_TIMEOUT)
+        .build()
+        .map_err(failure)?;
+    // GitHub API 对无 User-Agent 的请求直接 403。
+    let release = client
+        .get(RELEASES_API_URL)
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("fhdc/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(failure)?
+        .json::<LatestRelease>()
+        .await
+        .map_err(failure)?;
+    Ok(evaluate_update(&release, env!("CARGO_PKG_VERSION")))
+}
+
+/// 更新器消费的 GitHub 发布 JSON 子集。
+#[derive(serde::Deserialize, Clone, Debug)]
+struct LatestRelease {
+    #[serde(default)]
+    tag_name: String,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug, PartialEq)]
+struct ReleaseAsset {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    browser_download_url: String,
+}
+
+/// 比较发布与当前版本。解析不了的 tag 一律视为"已最新":
+/// 畸形的广告应该保持安静,而不是骚扰用户。
+fn evaluate_update(release: &LatestRelease, current: &str) -> fhdc_domain::UpdateCheckOutcome {
+    let parse = |text: &str| {
+        text.trim()
+            .trim_start_matches(['v', 'V'])
+            .parse::<semver::Version>()
+            .ok()
+    };
+    let (Some(latest), Some(running)) = (parse(&release.tag_name), parse(current)) else {
+        return fhdc_domain::UpdateCheckOutcome::UpToDate;
+    };
+    if latest <= running {
+        return fhdc_domain::UpdateCheckOutcome::UpToDate;
+    }
+    let (binary, checksum) = select_update_assets(&release.assets, UPDATE_BINARY_SUFFIX);
+    fhdc_domain::UpdateCheckOutcome::Available(fhdc_domain::UpdateInfo {
+        version: latest.to_string(),
+        url: release.html_url.clone(),
+        asset_url: binary.map(|asset| asset.browser_download_url.clone()),
+        asset_size: binary.map(|asset| asset.size),
+        checksum_url: binary
+            .and(checksum)
+            .map(|asset| asset.browser_download_url.clone()),
+    })
+}
+
+/// 挑出本构建可自升级的资源:裸 exe + 校验和清单。
+/// 没有裸 exe 就没有可校验的东西,两者都返回 None,流程降级为纯链接。
+fn select_update_assets<'a>(
+    assets: &'a [ReleaseAsset],
+    binary_suffix: Option<&str>,
+) -> (Option<&'a ReleaseAsset>, Option<&'a ReleaseAsset>) {
+    let Some(suffix) = binary_suffix else {
+        return (None, None);
+    };
+    let binary = assets.iter().find(|asset| asset.name.ends_with(suffix));
+    let checksum = binary.and_then(|_| {
+        assets
+            .iter()
+            .find(|asset| asset.name.ends_with(UPDATE_CHECKSUM_SUFFIX))
+    });
+    (binary, checksum)
+}
+
+/// 从 sha256sum 风格的清单里取指定资源的摘要,统一小写。
+fn parse_checksums(manifest: &str, asset_name: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let digest = fields.next()?;
+        let name = fields.next()?;
+        (name == asset_name && digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| digest.to_ascii_lowercase())
+    })
+}
+
+/// `<exe>.download` 落盘路径:校验通过前,半个二进制绝不会被当成更新。
+fn partial_download_path(exe: &std::path::Path) -> PathBuf {
+    exe.with_extension("exe.download")
+}
+
+/// `<exe>.new` 暂存路径:UI 触发的换名会把它挪到运行中的二进制名上。
+pub fn staged_update_path(exe: &std::path::Path) -> PathBuf {
+    exe.with_extension("exe.new")
+}
+
+/// 下载发布二进制到运行目录旁,校验 SHA256 后暂存,等 UI 触发换名。
+/// 进度按 UPDATE_PROGRESS_INTERVAL 节流;取消或失败都会删除半成品文件。
+async fn download_update(
+    info: fhdc_domain::UpdateInfo,
+    events: mpsc::Sender<BackendEvent>,
+    context: Context,
+    cancel: CancellationToken,
+) {
+    let scratch = std::env::current_exe()
+        .ok()
+        .map(|exe| (partial_download_path(&exe), staged_update_path(&exe)));
+    let outcome = match scratch.as_ref() {
+        Some((partial, staging)) => {
+            stream_update(&info, partial, staging, &events, &context, &cancel).await
+        }
+        None => Err(BridgeError::new(
+            ErrorCode::Internal,
+            "无法定位当前可执行文件,更新已取消",
+        )),
+    };
+    if outcome.is_err()
+        && let Some((partial, _)) = &scratch
+    {
+        let _ = tokio::fs::remove_file(partial).await;
+    }
+    send_event(
+        &events,
+        &context,
+        BackendEvent::UpdateDownloadFinished(outcome),
+    )
+    .await;
+}
+
+async fn stream_update(
+    info: &fhdc_domain::UpdateInfo,
+    partial: &std::path::Path,
+    staging: &std::path::Path,
+    events: &mpsc::Sender<BackendEvent>,
+    context: &Context,
+    cancel: &CancellationToken,
+) -> Result<(), BridgeError> {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    fn fail(detail: impl std::fmt::Display) -> BridgeError {
+        BridgeError::new(ErrorCode::Internal, detail.to_string())
+    }
+    let (Some(asset_url), Some(checksum_url)) = (&info.asset_url, &info.checksum_url) else {
+        return Err(fail("该发布没有可校验的二进制资源,请手动下载"));
+    };
+    let user_agent = concat!("fhdc/", env!("CARGO_PKG_VERSION"));
+    let client = reqwest::Client::builder()
+        // 不设总超时:慢链路上的大文件是合法的;连接与停滞读仍有界,
+        // 用户随时可取消。
+        .connect_timeout(UPDATE_HTTP_TIMEOUT)
+        .read_timeout(UPDATE_HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| fail(format!("下载更新失败: {error}")))?;
+    let mut download = client
+        .get(asset_url)
+        .header(reqwest::header::USER_AGENT, user_agent)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|error| fail(format!("下载更新失败: {error}")))?;
+    let total = download.content_length().or(info.asset_size);
+    let mut file = tokio::fs::File::create(partial)
+        .await
+        .map_err(|error| fail(format!("写入更新文件失败: {error}")))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut received: u64 = 0;
+    let mut last_progress = std::time::Instant::now();
+    loop {
+        if cancel.is_cancelled() {
+            return Err(BridgeError::new(ErrorCode::Cancelled, "已取消下载"));
+        }
+        let Some(chunk) = download
+            .chunk()
+            .await
+            .map_err(|error| fail(format!("下载更新失败: {error}")))?
+        else {
+            break;
+        };
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| fail(format!("写入更新文件失败: {error}")))?;
+        received += chunk.len() as u64;
+        if last_progress.elapsed() >= UPDATE_PROGRESS_INTERVAL {
+            last_progress = std::time::Instant::now();
+            send_event(
+                events,
+                context,
+                BackendEvent::UpdateDownloadProgress { received, total },
+            )
+            .await;
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|error| fail(format!("写入更新文件失败: {error}")))?;
+    drop(file);
+
+    // 清单在正文下载完成后才取,长下载不会占着第二条连接。
+    let manifest = client
+        .get(checksum_url)
+        .header(reqwest::header::USER_AGENT, user_agent)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|error| fail(format!("获取校验和失败: {error}")))?
+        .text()
+        .await
+        .map_err(|error| fail(format!("获取校验和失败: {error}")))?;
+    let expected = parse_checksums(&manifest, asset_url.rsplit('/').next().unwrap_or_default())
+        .ok_or_else(|| fail("校验和清单里没有该资源的条目"))?;
+    let actual = hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(fail("下载的文件与发布的校验和不匹配"));
+    }
+    tokio::fs::rename(partial, staging)
+        .await
+        .map_err(|error| fail(format!("暂存更新失败: {error}")))
+}
+
+#[cfg(test)]
+mod update_check_tests {
+    use super::{
+        LatestRelease, ReleaseAsset, evaluate_update, parse_checksums, select_update_assets,
+    };
+    use fhdc_domain::UpdateCheckOutcome;
+
+    fn release(tag: &str, assets: Vec<ReleaseAsset>) -> LatestRelease {
+        LatestRelease {
+            tag_name: tag.to_owned(),
+            html_url: format!("https://github.com/yeqing17/fhdc/releases/tag/{tag}"),
+            assets,
+        }
+    }
+
+    fn asset(name: &str) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.to_owned(),
+            size: 1024,
+            browser_download_url: format!(
+                "https://github.com/yeqing17/fhdc/releases/download/x/{name}"
+            ),
+        }
+    }
+
+    #[test]
+    fn newer_release_with_windows_assets_is_available() {
+        let assets = vec![
+            asset("fhdc-v0.2.0-x86_64-pc-windows-msvc"),
+            asset("fhdc-v0.2.0-x86_64-pc-windows-msvc.exe"),
+            asset("fhdc-v0.2.0-SHA256SUMS.txt"),
+        ];
+        let outcome = evaluate_update(&release("v0.2.0", assets), "0.1.0");
+        let UpdateCheckOutcome::Available(info) = outcome else {
+            panic!("应当有更新");
+        };
+        assert_eq!(info.version, "0.2.0");
+        assert!(
+            info.asset_url
+                .as_deref()
+                .expect("裸 exe 资源")
+                .ends_with(".exe")
+        );
+        assert!(
+            info.checksum_url
+                .as_deref()
+                .expect("校验和资源")
+                .ends_with("SHA256SUMS.txt")
+        );
+    }
+
+    #[test]
+    fn same_or_older_or_malformed_tags_stay_quiet() {
+        let assets = vec![asset("fhdc-v0.0.1-x86_64-pc-windows-msvc.exe")];
+        assert_eq!(
+            evaluate_update(&release("v0.0.1", assets.clone()), "0.1.0"),
+            UpdateCheckOutcome::UpToDate
+        );
+        assert_eq!(
+            evaluate_update(&release("v0.1.0", assets), "0.1.0"),
+            UpdateCheckOutcome::UpToDate
+        );
+        assert_eq!(
+            evaluate_update(&release("not-a-version", Vec::new()), "0.1.0"),
+            UpdateCheckOutcome::UpToDate
+        );
+    }
+
+    #[test]
+    fn checksum_manifest_parsing() {
+        // sha256sum 风格:合法行必须恰好 64 个十六进制字符。
+        let digest = "a1".repeat(32);
+        let manifest = format!("{digest}  one.zip\n00112233ff  two.exe\n{digest} three.zip\n");
+        assert_eq!(parse_checksums(&manifest, "one.zip"), Some(digest.clone()));
+        // 摘要长度不是 64 的行视为非法。
+        assert_eq!(parse_checksums(&manifest, "two.exe"), None);
+        // 字段间必须至少一个空格;名字不匹配的行跳过。
+        assert_eq!(parse_checksums(&manifest, "three.zip"), Some(digest));
+        assert_eq!(parse_checksums(&manifest, "missing"), None);
+    }
+
+    #[test]
+    fn asset_selection_requires_checksum_for_self_update() {
+        let assets = vec![asset("x86_64-pc-windows-msvc.exe")];
+        let (binary, checksum) = select_update_assets(&assets, Some("x86_64-pc-windows-msvc.exe"));
+        assert!(binary.is_some());
+        assert!(checksum.is_none());
+        assert_eq!(select_update_assets(&assets, None), (None, None));
     }
 }

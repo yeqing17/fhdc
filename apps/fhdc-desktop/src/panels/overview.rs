@@ -34,6 +34,11 @@ impl OverviewState {
     }
 
     /// 目标在线但数据为空时请求加载(带节流由调用方控制)。
+    /// 供上层在命令发送失败时回收乐观置位的加载状态。
+    pub fn reset_loading(&mut self) {
+        self.loading = false;
+    }
+
     pub fn wants_load(&self, ctx: &PanelCtx) -> bool {
         ctx.online() && self.loaded.is_none() && self.error.is_none() && !self.loading
     }

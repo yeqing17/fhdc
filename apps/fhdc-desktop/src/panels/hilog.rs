@@ -378,17 +378,17 @@ impl HilogState {
             let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
             ui.set_min_width(ui.available_width());
             if visible_len == 0 {
-                // 空态占住一块区域并给出提示,与终端面板一致,
-                // 避免塌成只剩边距的一条细边。
+                // 空态占住一块区域并给出提示,与终端面板一致。
+                // 区分三种情况:有数据但被过滤光 / 还没收到数据 / 未开始。
+                let hint = if !self.lines.is_empty() {
+                    "当前级别/关键字下没有匹配的日志行"
+                } else if self.running {
+                    "等待日志…"
+                } else {
+                    "点击「开始」抓取设备日志"
+                };
                 ui.set_min_height(160.0);
-                ui.label(
-                    egui::RichText::new(if self.running {
-                        "等待日志…"
-                    } else {
-                        "点击「开始」抓取设备日志"
-                    })
-                    .weak(),
-                );
+                ui.label(egui::RichText::new(hint).weak());
                 return;
             }
             egui::ScrollArea::vertical()
