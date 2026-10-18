@@ -49,6 +49,11 @@ impl ProcessesState {
         }
         self.target = target;
         self.processes.clear();
+        // 显示缓存必须一起失效:否则关掉自动刷新时,切设备后仍显示
+        // 上一台设备的进程表,而"结束进程"会把旧 PID 发到新设备上。
+        self.display_cache.clear();
+        self.display_cache_key = None;
+        self.processes_generation += 1;
         self.error = None;
         self.last_refresh = None;
         self.kill_prompt = None;

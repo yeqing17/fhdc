@@ -1,5 +1,6 @@
 //! 交互式终端:滚动回显 + 输入行 + 快捷指令栏。
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use eframe::egui;
@@ -23,8 +24,8 @@ use super::PanelCtx;
 const MAX_TAIL_LINES: usize = 5000;
 /// 回显字节上限(超限从最旧的行开始丢弃)。
 const MAX_TAIL_BYTES: usize = 256 * 1024;
-/// 回显行高(等宽字体,单行不换行)。
-const TAIL_ROW_HEIGHT: f32 = 16.0;
+/// 未换行残留的上限:超过就强制断行,避免无换行输出撑爆内存。
+const MAX_PENDING_BYTES: usize = 64 * 1024;
 /// 输入历史上限。
 const MAX_HISTORY: usize = 64;
 
@@ -42,14 +43,16 @@ pub struct ShellState {
     session: Option<SessionId>,
     status: Status,
     error: Option<BridgeError>,
-    /// 已完成行的回显(只保留尾部,行级虚拟化渲染)。
-    tail: Vec<String>,
+    /// 已完成行的回显(只保留尾部,行级虚拟化渲染;队首弹出 O(1))。
+    tail: VecDeque<String>,
     /// 末尾尚未收到换行的片段:实时回显输入字符。
     pending_line: String,
     /// tail 中所有行的字节数,用于超限裁剪。
     tail_bytes: usize,
     /// 跨块续接的 UTF-8 解码残留。
     utf8: super::Utf8Accumulator,
+    /// 跨块续接的 ANSI 转义尾巴。
+    ansi_pending: String,
     input: String,
     history: Vec<String>,
     history_cursor: Option<usize>,
@@ -66,10 +69,11 @@ impl ShellState {
             session: None,
             status: Status::Disconnected,
             error: None,
-            tail: Vec::new(),
+            tail: VecDeque::new(),
             pending_line: String::new(),
             tail_bytes: 0,
             utf8: super::Utf8Accumulator::new(),
+            ansi_pending: String::new(),
             input: String::new(),
             history: Vec::new(),
             history_cursor: None,
@@ -167,9 +171,10 @@ impl ShellState {
     }
 
     fn append_bytes(&mut self, bytes: &[u8]) {
-        // 先经增量解码器续接跨块的汉字,再做 ANSI 清洗。
+        // 先经增量解码器续接跨块的汉字,再流式清洗 ANSI(转义尾巴
+        // 也可能被切块切断,同样跨块续接)。
         let text = self.utf8.push(bytes);
-        let cleaned = strip_ansi(&text);
+        let cleaned = strip_ansi_stream(&mut self.ansi_pending, &text);
         // 按行切分:首段并入未换行残留成为完整行,末段成为新的残留。
         let mut split = cleaned.split('\n');
         let remainder = split.next_back().unwrap_or_default().to_owned();
@@ -177,15 +182,29 @@ impl ShellState {
             self.pending_line.push_str(line);
             let complete = std::mem::take(&mut self.pending_line);
             self.tail_bytes += complete.len() + 1;
-            self.tail.push(complete);
+            self.tail.push_back(complete);
         }
         self.pending_line.push_str(&remainder);
-        // 超限时从最旧的行开始丢弃。
+        // 无换行的超长输出(cat 二进制、dd 刷屏)会让 pending_line 无界
+        // 增长:超过上限就强制断行推进 tail,交给下面的裁剪逻辑接管。
+        if self.pending_line.len() > MAX_PENDING_BYTES {
+            let mut cut = MAX_PENDING_BYTES;
+            while !self.pending_line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let overflow = self.pending_line.split_off(cut);
+            let head = std::mem::take(&mut self.pending_line);
+            self.tail_bytes += head.len() + 1;
+            self.tail.push_back(head);
+            self.pending_line = overflow;
+        }
+        // 超限时从最旧的行开始丢弃(VecDeque 头部弹出是 O(1))。
         while self.tail.len() > MAX_TAIL_LINES
             || (self.tail_bytes > MAX_TAIL_BYTES && self.tail.len() > 1)
         {
-            let dropped = self.tail.remove(0);
-            self.tail_bytes -= dropped.len() + 1;
+            if let Some(dropped) = self.tail.pop_front() {
+                self.tail_bytes -= dropped.len() + 1;
+            }
         }
     }
 
@@ -193,11 +212,17 @@ impl ShellState {
         self.tail.clear();
         self.pending_line.clear();
         self.tail_bytes = 0;
+        self.ansi_pending.clear();
     }
 
     /// 完整回显文本(复制全部用)。
     fn display_text(&self) -> String {
-        let mut text = self.tail.join("\n");
+        let mut text = self
+            .tail
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
         if !self.pending_line.is_empty() {
             if !text.is_empty() {
                 text.push('\n');
@@ -307,6 +332,11 @@ impl ShellState {
             .inner_margin(8.0);
         frame.show(ui, |ui| {
             ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            // 每行一个 Label,全局 8px 的纵向 item_spacing 会把终端撑成
+            // 双倍行距;行高用字体实际行高,不再手工估。
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+            let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
             let total_rows = self.tail.len() + usize::from(!self.pending_line.is_empty());
             if total_rows == 0 {
                 ui.set_min_height(160.0);
@@ -322,7 +352,7 @@ impl ShellState {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .stick_to_bottom(true)
-                    .show_rows(ui, TAIL_ROW_HEIGHT, total_rows, |ui, range| {
+                    .show_rows(ui, row_height, total_rows, |ui, range| {
                         ui.set_min_width(ui.available_width());
                         for index in range {
                             let text = if index < self.tail.len() {
@@ -399,44 +429,70 @@ impl ShellState {
     }
 }
 
-/// 去除 ANSI 转义序列(CSI/OSC),把 CR 归一为 LF,避免回显错乱。
-pub fn strip_ansi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
+/// 尝试消费 `index` 处开始的转义序列,返回序列结束位置;
+/// None 表示序列在块尾不完整,应留待下一块续接。
+fn ansi_sequence_end(chars: &[char], index: usize) -> Option<usize> {
+    match chars.get(index + 1)? {
+        // CSI:参数与中间字节之后,最终字节落在 0x40..=0x7E。
+        '[' => {
+            let mut scan = index + 2;
+            loop {
+                match chars.get(scan) {
+                    Some(final_byte) if ('\u{40}'..='\u{7e}').contains(final_byte) => {
+                        return Some(scan + 1);
+                    }
+                    Some(_) => scan += 1,
+                    None => return None,
                 }
-                output.push('\n');
             }
-            '\x1b' => match chars.next() {
-                Some('[') => {
-                    // CSI:参数与中间字节直到最终字节(0x40..=0x7E)。
-                    for inner in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&inner) {
-                            break;
-                        }
+        }
+        // OSC:直到 BEL,或 ST(ESC \)。
+        ']' => {
+            let mut scan = index + 2;
+            loop {
+                match chars.get(scan) {
+                    Some('\u{07}') => return Some(scan + 1),
+                    Some('\x1b') if chars.get(scan + 1) == Some(&'\\') => {
+                        return Some(scan + 2);
                     }
+                    Some(_) => scan += 1,
+                    None => return None,
                 }
-                Some(']') => {
-                    // OSC:直到 BEL 或 ST。
-                    for inner in chars.by_ref() {
-                        if inner == '\x07' {
-                            break;
-                        }
-                        if inner == '\x1b' {
-                            let _ = chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            other => output.push(other),
+            }
+        }
+        // 其它两字符转义。
+        _ => Some(index + 2),
+    }
+}
+
+/// 流式清洗 ANSI 转义并把 CR 归一为 LF。转义序列可能被分块切断,
+/// 不完整的尾巴存进 `pending`,与下一块拼接后重新处理。
+fn strip_ansi_stream(pending: &mut String, input: &str) -> String {
+    let mut source = std::mem::take(pending);
+    source.push_str(input);
+    let chars: Vec<char> = source.chars().collect();
+    let mut output = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\x1b' {
+            match ansi_sequence_end(&chars, index) {
+                Some(end) => index = end,
+                None => break,
+            }
+        } else if ch == '\r' {
+            if chars.get(index + 1) == Some(&'\n') {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            output.push('\n');
+        } else {
+            output.push(ch);
+            index += 1;
         }
     }
+    *pending = chars[index..].iter().collect();
     output
 }
 
@@ -446,12 +502,47 @@ mod tests {
 
     #[test]
     fn strips_csi_osc_and_cr() {
+        let mut pending = String::new();
         let input = "\x1b[32mOK\x1b[0m\r\ndone\r\x1b]0;title\x07tail";
-        assert_eq!(strip_ansi(input), "OK\ndone\ntail");
+        assert_eq!(strip_ansi_stream(&mut pending, input), "OK\ndone\ntail");
+        assert!(pending.is_empty());
     }
 
     #[test]
     fn keeps_plain_text() {
-        assert_eq!(strip_ansi("普通文本 中文 line\n"), "普通文本 中文 line\n");
+        let mut pending = String::new();
+        assert_eq!(
+            strip_ansi_stream(&mut pending, "普通文本 中文 line\n"),
+            "普通文本 中文 line\n"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn holds_incomplete_escape_across_chunks() {
+        // 切在 ESC 与 '[' 之间
+        let mut pending = String::new();
+        assert_eq!(strip_ansi_stream(&mut pending, "A\x1b"), "A");
+        assert_eq!(strip_ansi_stream(&mut pending, "[32mB"), "B");
+        assert!(pending.is_empty());
+        // 切在 CSI 参数中间
+        let mut pending = String::new();
+        assert_eq!(strip_ansi_stream(&mut pending, "\x1b[3"), "");
+        assert_eq!(strip_ansi_stream(&mut pending, "2mC"), "C");
+        // 切在 OSC 内部(BEL 终止符在下一块)
+        let mut pending = String::new();
+        assert_eq!(strip_ansi_stream(&mut pending, "\x1b]0;ti"), "");
+        assert_eq!(strip_ansi_stream(&mut pending, "tle\x07D"), "D");
+        // OSC 以 ST(ESC \) 终止
+        let mut pending = String::new();
+        assert_eq!(strip_ansi_stream(&mut pending, "\x1b]8;;"), "");
+        assert_eq!(strip_ansi_stream(&mut pending, "url\x1b\\E"), "E");
+    }
+
+    #[test]
+    fn normalizes_lone_cr() {
+        let mut pending = String::new();
+        assert_eq!(strip_ansi_stream(&mut pending, "a\rb\r\n"), "a\nb\n");
+        assert!(pending.is_empty());
     }
 }

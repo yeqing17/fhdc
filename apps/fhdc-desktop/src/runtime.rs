@@ -100,11 +100,14 @@ async fn send_event(tx: &mpsc::Sender<BackendEvent>, context: &Context, event: B
     }
 }
 
-/// 后台任务完成回执:传输收尾或设备发现结果。
+/// 后台任务完成回执:传输收尾、设备发现结果、或"设备集合已变请立刻重发现"。
 enum Completion {
     Transfer(OperationId),
     /// 发现任务完成;Err 时保留上一次快照,不清空设备列表。
     Discovered(Result<Vec<fhdc_domain::DeviceDescriptor>, BridgeError>),
+    /// 连接/断开/监听切换等改变了设备集合,主循环应立刻再发现一次,
+    /// 不必等下一个轮询周期(最坏约 4 秒)。
+    Rediscover,
 }
 
 async fn run_backend(
@@ -130,6 +133,8 @@ async fn run_backend(
     );
     let mut discovery_healthy = true;
     let mut last_broadcast: Option<fhdc_domain::DeviceSnapshot> = None;
+    // 发现进行中收到的刷新请求:结束后补跑一次,不静默丢弃。
+    let mut rediscover_requested = false;
 
     // 启动时的第一次发现。
     spawn_discovery(&transport, &done_tx);
@@ -151,6 +156,14 @@ async fn run_backend(
                 match completion {
                     Completion::Transfer(operation) => {
                         transfers.remove(&operation);
+                    }
+                    Completion::Rediscover => {
+                        if !discovery_in_flight {
+                            discovery_in_flight = true;
+                            spawn_discovery(&transport, &done_tx);
+                        } else {
+                            rediscover_requested = true;
+                        }
                     }
                     Completion::Discovered(result) => {
                         discovery_in_flight = false;
@@ -182,6 +195,12 @@ async fn run_backend(
                                 }
                             }
                         }
+                        // 补上发现进行中错过的刷新请求。
+                        if rediscover_requested && !discovery_in_flight {
+                            rediscover_requested = false;
+                            discovery_in_flight = true;
+                            spawn_discovery(&transport, &done_tx);
+                        }
                     }
                 }
                 continue;
@@ -197,6 +216,9 @@ async fn run_backend(
                 if !discovery_in_flight {
                     discovery_in_flight = true;
                     spawn_discovery(&transport, &done_tx);
+                } else {
+                    // 正在发现中:记下来,当前这轮结束后立刻补跑。
+                    rediscover_requested = true;
                 }
             }
             BackendCommand::SelectDevice { key } => match registry.select(key) {
@@ -209,12 +231,17 @@ async fn run_backend(
             },
             BackendCommand::ConnectEndpoint(endpoint) => {
                 // 网络连接可能阻塞数秒(不可达地址等),异步执行避免卡住
-                // 命令队列;设备列表由发现轮询自然刷新。
+                // 命令队列;成功后立刻触发一次发现,不必等轮询周期。
                 let transport = Arc::clone(&transport);
                 let event_tx = event_tx.clone();
                 let context = context.clone();
+                let done_tx = done_tx.clone();
                 tokio::spawn(async move {
-                    match transport.connect_endpoint(&endpoint).await {
+                    let outcome = transport.connect_endpoint(&endpoint).await;
+                    if outcome.is_ok() {
+                        let _ = done_tx.send(Completion::Rediscover).await;
+                    }
+                    match outcome {
                         Ok(message) => {
                             send_event(
                                 &event_tx,
@@ -241,8 +268,13 @@ async fn run_backend(
                 let transport = Arc::clone(&transport);
                 let event_tx = event_tx.clone();
                 let context = context.clone();
+                let done_tx = done_tx.clone();
                 tokio::spawn(async move {
-                    match transport.disconnect_endpoint(&endpoint).await {
+                    let outcome = transport.disconnect_endpoint(&endpoint).await;
+                    if outcome.is_ok() {
+                        let _ = done_tx.send(Completion::Rediscover).await;
+                    }
+                    match outcome {
                         Ok(message) => {
                             send_event(
                                 &event_tx,
@@ -263,9 +295,15 @@ async fn run_backend(
                     let transport = Arc::clone(&transport);
                     let event_tx = event_tx.clone();
                     let context = context.clone();
+                    let done_tx = done_tx.clone();
                     let key = target.key;
                     tokio::spawn(async move {
-                        match transport.enable_tcp_listen(&key, port).await {
+                        let outcome = transport.enable_tcp_listen(&key, port).await;
+                        if outcome.is_ok() {
+                            // tmode 通常会让设备从 USB 侧掉线转为监听,立刻重发现。
+                            let _ = done_tx.send(Completion::Rediscover).await;
+                        }
+                        match outcome {
                             Ok(message) => {
                                 send_event(
                                     &event_tx,
@@ -301,10 +339,13 @@ async fn run_backend(
                 let transport = Arc::clone(&transport);
                 let event_tx = event_tx.clone();
                 let context = context.clone();
+                let done_tx = done_tx.clone();
                 tokio::spawn(async move {
                     if let Ok(message) = transport.kill_server().await {
                         send_event(&event_tx, &context, BackendEvent::ServerKilled { message })
                             .await;
+                        // 服务重启后设备视图可能整体变化,立刻重新发现。
+                        let _ = done_tx.send(Completion::Rediscover).await;
                     }
                 });
             }

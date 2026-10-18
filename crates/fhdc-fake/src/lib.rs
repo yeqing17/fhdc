@@ -477,10 +477,18 @@ impl HdcTransport for FakeHdcTransport {
         key: &ConnectKey,
         _remote: &RemotePath,
         local: &Path,
-        _overwrite: OverwritePolicy,
+        overwrite: OverwritePolicy,
         cancellation: &CancellationToken,
     ) -> Result<(), BridgeError> {
         self.require_key(key).await?;
+        // 与真后端同语义:本地已存在 + Deny(或符号链接)即拒绝,
+        // 让 UI 的覆盖确认流程在假后端下也能演练。
+        if local.exists() && (local.is_symlink() || overwrite == OverwritePolicy::Deny) {
+            return Err(BridgeError::new(
+                ErrorCode::AlreadyExists,
+                format!("本地已存在: {}", local.display()),
+            ));
+        }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(700)) => {}
             () = cancellation.cancelled() => return Err(BridgeError::new(ErrorCode::Cancelled, "操作已取消")),
@@ -552,7 +560,11 @@ impl HdcTransport for FakeHdcTransport {
     async fn delete_entry(&self, key: &ConnectKey, path: &RemotePath) -> Result<(), BridgeError> {
         self.require_key(key).await?;
         let mut state = self.state.lock().await;
-        state.directories.retain(|(dir, _)| dir != path.as_str());
+        // 递归语义与真后端对齐:目录下的子目录一并移除。
+        let prefix = format!("{}/", path.as_str().trim_end_matches('/'));
+        state
+            .directories
+            .retain(|(dir, _)| dir != path.as_str() && !dir.starts_with(&prefix));
         if let Some(parent) = path.parent() {
             let name = path.file_name().unwrap_or("").to_owned();
             let parent = parent.as_str().to_owned();

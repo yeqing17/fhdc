@@ -62,15 +62,22 @@ pub struct FilesState {
 }
 
 impl FilesState {
+    /// 让列表与排序缓存一起失效。所有改动 `entries` 的路径都必须走这里,
+    /// 否则新数据到达前会继续画上一份列表。
+    fn invalidate_entries(&mut self) {
+        self.entries.clear();
+        self.sorted_cache.clear();
+        self.sort_cache_key = None;
+        self.entries_generation += 1;
+    }
+
     pub fn reset_for(&mut self, target: Option<DeviceTarget>) {
         if self.target.as_ref() == target.as_ref() {
             return;
         }
         self.target = target;
         self.path = None;
-        self.entries.clear();
-        self.sorted_cache.clear();
-        self.sort_cache_key = None;
+        self.invalidate_entries();
         self.error = None;
         self.loading = false;
         self.transfers.clear();
@@ -201,7 +208,8 @@ impl FilesState {
 
     fn navigate(&mut self, path: RemotePath) -> Option<BackendCommand> {
         self.path = Some(path.clone());
-        self.entries.clear();
+        // 切目录立即失效列表缓存,新数据到达前不再显示上一个目录的行。
+        self.invalidate_entries();
         self.reload(&Some(path))
     }
 

@@ -20,7 +20,6 @@ use super::PanelCtx;
 
 /// 行缓冲上限。
 const MAX_LINES: usize = 10_000;
-const ROW_HEIGHT: f32 = 17.0;
 
 const LEVELS: [char; 6] = ['*', 'D', 'I', 'W', 'E', 'F'];
 
@@ -140,6 +139,11 @@ impl HilogState {
         self.lines.clear();
         self.pending.clear();
         self.utf8 = super::Utf8Accumulator::new();
+        // 可见索引缓存一并失效:否则按旧行数渲染,切设备后出现一片
+        // 幻影空行(行号都在,self.lines.get 全为 None)。
+        self.visible.clear();
+        self.applied_filter = None;
+        self.data_generation += 1;
         self.error = None;
         self.last_start_attempt = None;
         close
@@ -360,16 +364,21 @@ impl HilogState {
         let visible_len = self.visible.len();
 
         let stick = self.auto_scroll;
+        // 行高用字体实际行高;行间纵向间距清零,避免全局 8px 间距
+        // 把日志行撑成双倍行距。
+        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+        let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font_id));
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .stick_to_bottom(stick)
-            .show_rows(ui, ROW_HEIGHT, visible_len, |ui, range| {
+            .show_rows(ui, row_height, visible_len, |ui, range| {
                 let frame = egui::Frame::new()
                     .fill(palette.terminal_bg)
                     .corner_radius(4.0)
                     .inner_margin(6.0);
                 frame.show(ui, |ui| {
                     ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     ui.set_min_width(ui.available_width());
                     for index in range {
                         let Some(buffer_index) = self.visible.get(index).copied() else {
