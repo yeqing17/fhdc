@@ -19,8 +19,8 @@ fn app_icon() -> eframe::egui::IconData {
         .to_rgba8();
     let (width, height) = img.dimensions();
     eframe::egui::IconData {
-        width: width.try_into().expect("图标宽度在 u32 范围内"),
-        height: height.try_into().expect("图标高度在 u32 范围内"),
+        width,
+        height,
         rgba: img.into_raw(),
     }
 }
