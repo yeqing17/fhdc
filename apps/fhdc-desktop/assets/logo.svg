@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<title>fhdc icon</title>
+<desc>Transparent vector logo with a geometric F, HDC lettering, terminal prompt and mint cursor.</desc>
+<g fill="#FFFFFF">
+  <path d="M160 145 H690 L610 245 H240 Z"/>
+  <path d="M205 340 H535 L455 440 H135 Z"/>
+  <path d="M135 390 H245 V855 H135 Z"/>
+</g>
+<text x="285" y="710" font-family="DejaVu Sans, Arial, sans-serif" font-size="178" font-weight="900" font-style="italic" letter-spacing="-12" fill="#FFFFFF">HDC</text>
+<path d="M758 620 L822 684 L758 748 Q747 759 735 747 L719 731 Q709 721 720 710 L746 684 L720 658 Q709 647 720 636 L735 621 Q747 609 758 620 Z" fill="#FFFFFF"/>
+<path d="M814 772 H912 Q927 772 921 786 L908 816 Q904 825 892 825 H794 Q779 825 785 811 L798 785 Q802 772 814 772 Z" fill="#00E6B8"/>
+</svg>
