@@ -11,5 +11,3 @@ workspace = true
 
 [dependencies]
 fhdc-domain.workspace = true
-
-[dev-dependencies]

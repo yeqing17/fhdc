@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -24,14 +25,12 @@ use tokio_util::sync::CancellationToken;
 const EVENT_CHANNEL_CAPACITY: usize = 512;
 /// 会话输出轮询周期:兼顾关闭延迟与 CPU 占用。
 const POLL_INTERVAL: Duration = Duration::from_millis(120);
+/// 设备发现轮询周期:插拔设备后最多这么多时间就能看到变化。
+const DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// 输出合并窗口:多个小块拼成一个事件再唤醒 UI。
 const COALESCE_WINDOW: Duration = Duration::from_millis(8);
 const COALESCE_MAX_CHUNKS: usize = 8;
 const COALESCE_MAX_BYTES: usize = 64 * 1024;
-
-struct ActiveSession {
-    cancel: CancellationToken,
-}
 
 pub struct RuntimeBridge {
     command_tx: mpsc::Sender<BackendCommand>,
@@ -79,6 +78,7 @@ impl RuntimeBridge {
                 let _ = sender.try_send(input.clone());
                 return;
             }
+            tracing::debug!(?session, "WriteShell 被丢弃:会话已关闭或尚未注册");
         }
         if self.command_tx.try_send(command).is_err() {
             tracing::warn!("后端命令队列已满,命令被丢弃");
@@ -111,14 +111,22 @@ async fn run_backend(
         return;
     };
     let mut registry = DeviceRegistry::new();
-    let mut sessions: HashMap<SessionId, ActiveSession> = HashMap::new();
+    // 共享会话表:转发任务结束时能自行清理,避免自然结束的会话泄漏。
+    let sessions: Arc<Mutex<HashMap<SessionId, CancellationToken>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let mut transfers: HashMap<OperationId, CancellationToken> = HashMap::new();
     let (done_tx, mut done_rx) = mpsc::channel::<OperationId>(64);
+    let mut discovery_tick = tokio::time::interval(DEVICE_POLL_INTERVAL);
 
     refresh_devices(&transport, &mut registry, &event_tx, &context).await;
 
     loop {
         let command = tokio::select! {
+            // 周期性设备发现:插拔设备无需手动刷新。
+            _ = discovery_tick.tick() => {
+                refresh_devices(&transport, &mut registry, &event_tx, &context).await;
+                continue;
+            }
             done = done_rx.recv() => {
                 if let Some(operation) = done {
                     transfers.remove(&operation);
@@ -144,68 +152,84 @@ async fn run_backend(
                 }
             },
             BackendCommand::ConnectEndpoint(endpoint) => {
-                match transport.connect_endpoint(&endpoint).await {
-                    Ok(message) => {
-                        send_event(
-                            &event_tx,
-                            &context,
-                            BackendEvent::EndpointConnectFinished { endpoint, message },
-                        )
-                        .await;
-                        refresh_devices(&transport, &mut registry, &event_tx, &context).await;
-                    }
-                    Err(error) => {
-                        send_event(
-                            &event_tx,
-                            &context,
-                            BackendEvent::EndpointConnectFailed {
-                                endpoint,
-                                error: error.detail,
-                            },
-                        )
-                        .await;
-                    }
-                }
-            }
-            BackendCommand::DisconnectEndpoint(endpoint) => {
-                match transport.disconnect_endpoint(&endpoint).await {
-                    Ok(message) => {
-                        send_event(
-                            &event_tx,
-                            &context,
-                            BackendEvent::EndpointDisconnected { endpoint, message },
-                        )
-                        .await;
-                        refresh_devices(&transport, &mut registry, &event_tx, &context).await;
-                    }
-                    Err(error) => {
-                        send_event(&event_tx, &context, BackendEvent::OperationFailed(error)).await;
-                    }
-                }
-            }
-            BackendCommand::EnableTcpListen { target, port } => {
-                if ensure_target(&registry, &target) {
-                    match transport.enable_tcp_listen(&target.key, port).await {
+                // 网络连接可能阻塞数秒(不可达地址等),异步执行避免卡住
+                // 命令队列;设备列表由发现轮询自然刷新。
+                let transport = Arc::clone(&transport);
+                let event_tx = event_tx.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    match transport.connect_endpoint(&endpoint).await {
                         Ok(message) => {
                             send_event(
                                 &event_tx,
                                 &context,
-                                BackendEvent::TcpListenEnabled { message },
+                                BackendEvent::EndpointConnectFinished { endpoint, message },
                             )
                             .await;
-                            refresh_devices(&transport, &mut registry, &event_tx, &context).await;
                         }
                         Err(error) => {
                             send_event(
                                 &event_tx,
                                 &context,
-                                BackendEvent::TcpListenFailed {
+                                BackendEvent::EndpointConnectFailed {
+                                    endpoint,
                                     error: error.detail,
                                 },
                             )
-                            .await
+                            .await;
                         }
                     }
+                });
+            }
+            BackendCommand::DisconnectEndpoint(endpoint) => {
+                let transport = Arc::clone(&transport);
+                let event_tx = event_tx.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    match transport.disconnect_endpoint(&endpoint).await {
+                        Ok(message) => {
+                            send_event(
+                                &event_tx,
+                                &context,
+                                BackendEvent::EndpointDisconnected { endpoint, message },
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            send_event(&event_tx, &context, BackendEvent::OperationFailed(error))
+                                .await;
+                        }
+                    }
+                });
+            }
+            BackendCommand::EnableTcpListen { target, port } => {
+                if ensure_target(&registry, &target) {
+                    let transport = Arc::clone(&transport);
+                    let event_tx = event_tx.clone();
+                    let context = context.clone();
+                    let key = target.key;
+                    tokio::spawn(async move {
+                        match transport.enable_tcp_listen(&key, port).await {
+                            Ok(message) => {
+                                send_event(
+                                    &event_tx,
+                                    &context,
+                                    BackendEvent::TcpListenEnabled { message },
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                send_event(
+                                    &event_tx,
+                                    &context,
+                                    BackendEvent::TcpListenFailed {
+                                        error: error.detail,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                    });
                 } else {
                     send_event(
                         &event_tx,
@@ -218,10 +242,15 @@ async fn run_backend(
                 }
             }
             BackendCommand::KillServer => {
-                if let Ok(message) = transport.kill_server().await {
-                    send_event(&event_tx, &context, BackendEvent::ServerKilled { message }).await;
-                }
-                refresh_devices(&transport, &mut registry, &event_tx, &context).await;
+                let transport = Arc::clone(&transport);
+                let event_tx = event_tx.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    if let Ok(message) = transport.kill_server().await {
+                        send_event(&event_tx, &context, BackendEvent::ServerKilled { message })
+                            .await;
+                    }
+                });
             }
             BackendCommand::LoadOverview(target) => {
                 if ensure_target(&registry, &target) {
@@ -403,12 +432,7 @@ async fn run_backend(
                         let input = handle.input();
                         shell_inputs.write().unwrap().insert(session, input);
                         let cancel = CancellationToken::new();
-                        sessions.insert(
-                            session,
-                            ActiveSession {
-                                cancel: cancel.clone(),
-                            },
-                        );
+                        sessions.lock().unwrap().insert(session, cancel.clone());
                         send_event(
                             &event_tx,
                             &context,
@@ -423,6 +447,7 @@ async fn run_backend(
                             event_tx.clone(),
                             context.clone(),
                             shell_inputs.clone(),
+                            sessions.clone(),
                         );
                     }
                     Err(error) => {
@@ -435,12 +460,13 @@ async fn run_backend(
                     }
                 }
             }
-            BackendCommand::WriteShell { .. } => {
-                // 由 RuntimeBridge::try_send 直接路由,这里只兜底。
+            BackendCommand::WriteShell { session, .. } => {
+                // 由 RuntimeBridge::try_send 直接路由;落到这里说明会话已不存在。
+                tracing::debug!(?session, "WriteShell 被丢弃:会话已关闭或尚未注册");
             }
             BackendCommand::CloseShell { session } => {
-                if let Some(active) = sessions.remove(&session) {
-                    active.cancel.cancel();
+                if let Some(cancel) = sessions.lock().unwrap().remove(&session) {
+                    cancel.cancel();
                 }
             }
             BackendCommand::StartHilog { target, session } => {
@@ -459,12 +485,7 @@ async fn run_backend(
                 match transport.start_hilog(&target.key).await {
                     Ok(handle) => {
                         let cancel = CancellationToken::new();
-                        sessions.insert(
-                            session,
-                            ActiveSession {
-                                cancel: cancel.clone(),
-                            },
-                        );
+                        sessions.lock().unwrap().insert(session, cancel.clone());
                         send_event(
                             &event_tx,
                             &context,
@@ -479,6 +500,7 @@ async fn run_backend(
                             event_tx.clone(),
                             context.clone(),
                             shell_inputs.clone(),
+                            sessions.clone(),
                         );
                     }
                     Err(error) => {
@@ -492,8 +514,8 @@ async fn run_backend(
                 }
             }
             BackendCommand::StopHilog { session } => {
-                if let Some(active) = sessions.remove(&session) {
-                    active.cancel.cancel();
+                if let Some(cancel) = sessions.lock().unwrap().remove(&session) {
+                    cancel.cancel();
                 }
             }
             BackendCommand::ClearDeviceHilog(target) => {
@@ -809,15 +831,10 @@ async fn spawn_mutation(
             fhdc_domain::FileMutationKind::CreateDirectory => {
                 transport.create_directory(&target.key, &path).await
             }
-            fhdc_domain::FileMutationKind::Rename => {
-                transport
-                    .rename_entry(
-                        &target.key,
-                        &path,
-                        second.as_ref().expect("rename needs destination"),
-                    )
-                    .await
-            }
+            fhdc_domain::FileMutationKind::Rename => match second.as_ref() {
+                Some(to) => transport.rename_entry(&target.key, &path, to).await,
+                None => Err(BridgeError::invalid_input("重命名缺少目标路径")),
+            },
             fhdc_domain::FileMutationKind::Delete => {
                 transport.delete_entry(&target.key, &path).await
             }
@@ -835,6 +852,7 @@ async fn spawn_mutation(
 }
 
 /// 转发会话输出直到流结束或取消,合并小包后发事件。
+#[expect(clippy::too_many_arguments, reason = "转发任务固定上下文集合")]
 fn spawn_forwarder(
     session: SessionId,
     handle: ShellSessionHandle,
@@ -843,6 +861,7 @@ fn spawn_forwarder(
     event_tx: mpsc::Sender<BackendEvent>,
     context: Context,
     shell_inputs: Arc<RwLock<HashMap<SessionId, mpsc::Sender<Vec<u8>>>>>,
+    sessions: Arc<Mutex<HashMap<SessionId, CancellationToken>>>,
 ) {
     tokio::spawn(async move {
         let mut handle = handle;
@@ -889,6 +908,7 @@ fn spawn_forwarder(
             send_event(&event_tx, &context, event).await;
         }
         shell_inputs.write().unwrap().remove(&session);
+        sessions.lock().unwrap().remove(&session);
         let event = if hilog {
             BackendEvent::HilogClosed { session }
         } else {

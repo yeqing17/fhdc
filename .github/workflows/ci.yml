@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup 会按 rust-toolchain.toml 自动安装固定版本的工具链。
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式化检查
+        run: cargo fmt --all --check
+
+      - name: Clippy(零警告)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test --workspace
+
+      - name: Release 构建
+        run: cargo build --release -p fhdc

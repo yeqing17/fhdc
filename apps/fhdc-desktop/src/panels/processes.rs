@@ -47,6 +47,8 @@ impl ProcessesState {
         self.error = None;
         self.last_refresh = None;
         self.kill_prompt = None;
+        // 就地复位加载态,旧 target 的结果事件不再匹配。
+        self.loading = false;
     }
 
     /// 面板可见时的周期刷新。
@@ -199,7 +201,10 @@ impl ProcessesState {
                             }
                         };
                         header(ui, "PID", SortKey::Pid, self);
-                        header(ui, "用户", SortKey::Pid, self);
+                        ui.add(
+                            egui::Button::new(egui::RichText::new("用户").weak().small())
+                                .frame(false),
+                        );
                         header(ui, "CPU%", SortKey::Cpu, self);
                         header(ui, "命令", SortKey::Name, self);
                         ui.end_row();

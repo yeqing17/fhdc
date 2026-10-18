@@ -315,7 +315,11 @@ impl FilesState {
                             }
                         };
                         header(ui, "名称", SortKey::Name);
-                        header(ui, "类型", SortKey::Name);
+                        // 类型列不支持排序,用普通弱化表头,避免误绑排序键。
+                        ui.add(
+                            egui::Button::new(egui::RichText::new("类型").weak().small())
+                                .frame(false),
+                        );
                         header(ui, "大小", SortKey::Size);
                         header(ui, "修改时间", SortKey::Modified);
                         ui.end_row();
@@ -327,12 +331,12 @@ impl FilesState {
                                 RemoteFileKind::Symlink => "↪",
                                 RemoteFileKind::Other => "•",
                             };
+                            // 图标与名称合入同一单元格,保证列数与表头一致。
                             let name_text = if entry.kind == RemoteFileKind::Directory {
-                                egui::RichText::new(&entry.name).strong()
+                                egui::RichText::new(format!("{icon} {}", entry.name)).strong()
                             } else {
-                                egui::RichText::new(&entry.name)
+                                egui::RichText::new(format!("{icon} {}", entry.name))
                             };
-                            ui.add(egui::Button::new(format!("{icon} ")).frame(false));
                             let name_response = ui
                                 .add(egui::Button::new(name_text).frame(false))
                                 .on_hover_text("双击进入/下载;右键更多操作");

@@ -315,6 +315,9 @@ impl HdcTransport for FakeHdcTransport {
 
     async fn start_shell(&self, key: &ConnectKey) -> Result<ShellSessionHandle, BridgeError> {
         self.require_key(key).await?;
+        // 克隆共享同一份内存状态,否则 default() 的空状态会让假终端
+        // 查不到包列表等数据。
+        let transport = self.clone();
         Ok(ShellSessionHandle::from_handler(
             |mut input, output, cancellation| async move {
                 let _ = output
@@ -323,7 +326,6 @@ impl HdcTransport for FakeHdcTransport {
                         bytes: b"OpenHarmony fake shell \r\n# ".to_vec(),
                     })
                     .await;
-                let transport = FakeHdcTransport::default();
                 loop {
                     tokio::select! {
                         () = cancellation.cancelled() => return Ok(Some(0)),

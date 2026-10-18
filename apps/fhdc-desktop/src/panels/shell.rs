@@ -39,6 +39,8 @@ pub struct ShellState {
     status: Status,
     error: Option<BridgeError>,
     buffer: String,
+    /// 跨块续接的 UTF-8 解码残留。
+    utf8: super::Utf8Accumulator,
     input: String,
     history: Vec<String>,
     history_cursor: Option<usize>,
@@ -56,6 +58,7 @@ impl ShellState {
             status: Status::Disconnected,
             error: None,
             buffer: String::new(),
+            utf8: super::Utf8Accumulator::new(),
             input: String::new(),
             history: Vec::new(),
             history_cursor: None,
@@ -86,6 +89,7 @@ impl ShellState {
         self.status = Status::Disconnected;
         self.error = None;
         self.buffer.clear();
+        self.utf8 = super::Utf8Accumulator::new();
         self.input.clear();
         self.history_cursor = None;
         self.last_connect_attempt = None;
@@ -152,7 +156,8 @@ impl ShellState {
     }
 
     fn append_bytes(&mut self, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes).into_owned();
+        // 先经增量解码器续接跨块的汉字,再做 ANSI 清洗。
+        let text = self.utf8.push(bytes);
         let cleaned = strip_ansi(&text);
         self.buffer.push_str(&cleaned);
         if self.buffer.len() > MAX_BUFFER_BYTES {
@@ -175,7 +180,11 @@ impl ShellState {
             });
         }
         self.history.push(line.clone());
-        self.history.truncate(MAX_HISTORY);
+        // truncate 保留的是最旧的 N 条,会把刚记录的命令丢掉;
+        // 超限时从头移除,永远保留最近的 MAX_HISTORY 条。
+        if self.history.len() > MAX_HISTORY {
+            self.history.remove(0);
+        }
         self.history_cursor = None;
         let mut payload = line.into_bytes();
         payload.push(b'\n');
@@ -326,10 +335,11 @@ impl ShellState {
                     }
                 }
                 Some(index) => {
+                    // 索引大 = 更新;↑ 往旧翻,↓ 往新翻。
                     let next = if down {
-                        index.saturating_sub(1)
-                    } else {
                         (index + 1).min(self.history.len() - 1)
+                    } else {
+                        index.saturating_sub(1)
                     };
                     self.history_cursor = Some(next);
                     self.input = self.history[next].clone();

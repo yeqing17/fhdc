@@ -131,7 +131,6 @@ pub struct FhdcApp {
     endpoint_input: String,
     listen_port: String,
     pending_select: Option<(ConnectKey, Instant)>,
-    last_device_refresh: Option<Instant>,
 }
 
 impl FhdcApp {
@@ -192,7 +191,6 @@ impl FhdcApp {
             endpoint_input: String::new(),
             listen_port: "5555".to_owned(),
             pending_select: None,
-            last_device_refresh: None,
         };
         app.apply_theme(&creation_context.egui_ctx);
         app
@@ -265,7 +263,6 @@ impl FhdcApp {
                 if let Ok(key) = ConnectKey::new(endpoint.target_string()) {
                     self.pending_select = Some((key, Instant::now()));
                 }
-                self.last_device_refresh = None;
             }
             BackendEvent::EndpointConnectFailed { endpoint, error } => {
                 self.last_error = Some(BridgeError::hdc(format!(
@@ -275,7 +272,6 @@ impl FhdcApp {
             }
             BackendEvent::EndpointDisconnected { endpoint, message } => {
                 self.show_toast(format!("已断开 {}: {message}", endpoint.target_string()));
-                self.last_device_refresh = None;
             }
             BackendEvent::TcpListenEnabled { message } => {
                 self.show_toast(format!(
@@ -287,7 +283,6 @@ impl FhdcApp {
             }
             BackendEvent::ServerKilled { message } => {
                 self.show_toast(format!("hdc 服务已重启: {message}"));
-                self.last_device_refresh = None;
             }
             BackendEvent::OverviewFailed(_, ref error)
             | BackendEvent::ProcessesFailed(_, ref error)

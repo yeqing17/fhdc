@@ -28,6 +28,9 @@ impl OverviewState {
         self.target = target;
         self.loaded = None;
         self.error = None;
+        // 进行中的加载事件带着旧 target 回来不会再匹配,必须就地复位,
+        // 否则面板会永久卡在加载态。
+        self.loading = false;
     }
 
     /// 目标在线但数据为空时请求加载(带节流由调用方控制)。
@@ -35,8 +38,13 @@ impl OverviewState {
         ctx.online() && self.loaded.is_none() && self.error.is_none() && !self.loading
     }
 
-    pub fn load_command(&self, ctx: &PanelCtx) -> Option<BackendCommand> {
-        ctx.target.clone().map(BackendCommand::LoadOverview)
+    /// 取加载命令;发送前就置位 loading,避免事件往返期间每帧重复请求。
+    pub fn load_command(&mut self, ctx: &PanelCtx) -> Option<BackendCommand> {
+        let command = ctx.target.clone().map(BackendCommand::LoadOverview);
+        if command.is_some() {
+            self.loading = true;
+        }
+        command
     }
 
     pub fn handle_event(&mut self, event: &BackendEvent) {

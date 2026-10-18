@@ -112,6 +112,8 @@ pub struct HilogState {
     query: String,
     lines: Vec<LogLine>,
     pending: String,
+    /// 跨块续接的 UTF-8 解码残留。
+    utf8: super::Utf8Accumulator,
     error: Option<BridgeError>,
     last_start_attempt: Option<Instant>,
 }
@@ -132,6 +134,7 @@ impl HilogState {
         self.paused = false;
         self.lines.clear();
         self.pending.clear();
+        self.utf8 = super::Utf8Accumulator::new();
         self.error = None;
         self.last_start_attempt = None;
         close
@@ -197,8 +200,10 @@ impl HilogState {
         if self.paused {
             return;
         }
+        // 先经增量解码器续接跨块的汉字,再与半行残留合并切分。
+        let decoded = self.utf8.push(bytes);
         let mut text = std::mem::take(&mut self.pending);
-        text.push_str(&String::from_utf8_lossy(bytes));
+        text.push_str(&decoded);
         let mut split = text.split('\n');
         let remainder = split.next_back().unwrap_or_default().to_owned();
         for line in split {

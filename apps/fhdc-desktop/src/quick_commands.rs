@@ -204,21 +204,21 @@ impl QuickCommandStore {
                     {
                         match import_json(&path) {
                             Ok(imported) => {
-                                let existing: Vec<(String, String)> = self
+                                // 快照 + 循环内同步更新,同一文件内的重复条目也去重。
+                                let mut existing: Vec<(String, String)> = self
                                     .commands
                                     .iter()
                                     .map(|command| (command.label.clone(), command.command.clone()))
                                     .collect();
                                 let mut added = 0;
                                 for command in imported {
-                                    if command.is_sendable()
-                                        && !existing.contains(&(
-                                            command.label.clone(),
-                                            command.command.clone(),
-                                        ))
-                                    {
-                                        self.commands.push(command);
-                                        added += 1;
+                                    if command.is_sendable() {
+                                        let key = (command.label.clone(), command.command.clone());
+                                        if !existing.contains(&key) {
+                                            existing.push(key);
+                                            self.commands.push(command);
+                                            added += 1;
+                                        }
                                     }
                                 }
                                 self.status = Some(format!("已导入 {added} 条"));

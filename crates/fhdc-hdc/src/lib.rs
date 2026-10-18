@@ -26,8 +26,8 @@ use fhdc_domain::{
 
 /// 单命令默认超时。
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
-/// 单命令默认输出上限。
-const DEFAULT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+/// 单命令默认输出上限(与 domain 的常量同源,避免两处魔数)。
+const DEFAULT_OUTPUT_LIMIT: usize = fhdc_domain::MAX_OUTPUT_BYTES;
 /// 安装 HAP 的超时。
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// 截图流水线各步超时。
@@ -476,9 +476,8 @@ impl HdcTransport for ProcessHdcTransport {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let combined = format!("{stdout} {stderr}").to_lowercase();
         let success_words = ["success", "finish", "完成"];
-        let failed = combined.contains("[fail]")
-            || combined.contains("failure")
-            || combined.contains("error");
+        // 失败词刻意收紧:"error" 单词太宽(如 "0 errors" 也会误中)。
+        let failed = combined.contains("[fail]") || combined.contains("failure");
         if output.exit_code == Some(0)
             && (!failed || success_words.iter().any(|word| combined.contains(word)))
         {
@@ -596,7 +595,16 @@ impl HdcTransport for ProcessHdcTransport {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        let bytes = tokio::fs::read(&local).await.unwrap_or_default();
+        let bytes = match tokio::fs::read(&local).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // 读取失败要如实上报,不能混进"不是有效 JPEG"误导排查。
+                return Err(BridgeError::new(
+                    ErrorCode::Internal,
+                    format!("读取拉取到本地的截图失败({}): {error}", local.display()),
+                ));
+            }
+        };
         let _ = tokio::fs::remove_file(&local).await;
         if bytes.len() > SCREENSHOT_LIMIT || !bytes.starts_with(&[0xFF, 0xD8]) {
             return Err(BridgeError::hdc("设备返回的不是有效 JPEG 图像"));

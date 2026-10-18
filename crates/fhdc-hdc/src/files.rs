@@ -17,8 +17,11 @@ use crate::process::run_bounded_cancellable;
 /// 传输类命令的最短超时:大文件可能很久。
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 设备端列表脚本:kind\x1Cname\x1Csize\x1Cmodified\x1Cperms\x0 记录流,
-/// 对任意文件名字符安全。字段:'l'=符号链接 'd'=目录 'f'=普通文件 'o'=其它。
+/// 设备端列表脚本:kind\034name\034size\034modified\034perms\036 记录流,
+/// 对任意文件名字符安全。字段用 FS(0x1C),记录用 RS(0x1E)——均为
+/// "信息分隔符"控制字符,且刻意避开 NUL(部分通道会吞掉 \000)。
+/// 转义用八进制而非 \xHH:八进制是 POSIX printf 标准写法,不依赖扩展。
+/// 字段:'l'=符号链接 'd'=目录 'f'=普通文件 'o'=其它。
 const LIST_SCRIPT: &str = r#"for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
   [ -e "$entry" ] || [ -L "$entry" ] || continue
   if [ -L "$entry" ]; then kind=l
@@ -28,7 +31,7 @@ const LIST_SCRIPT: &str = r#"for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
   fi
   set -- $(stat -c '%s %Y %A' "$entry" 2>/dev/null || echo '0 0 ?')
   name=${entry##*/}
-  printf '%s\x1c%s\x1c%s\x1c%s\x1c%s\x0' "$kind" "$name" "$1" "$2" "$3"
+  printf '%s\034%s\034%s\034%s\034%s\036' "$kind" "$name" "$1" "$2" "$3"
 done"#;
 
 /// POSIX 单引号包裹,内部单引号转成 `'\''`。
@@ -232,17 +235,17 @@ fn map_command_error(stderr: &[u8], stdout: &[u8]) -> BridgeError {
     })
 }
 
-/// 解析 `\x1C` 分隔、`\x0` 结尾的记录流。
+/// 解析 FS(0x1C) 分隔字段、RS(0x1E) 结尾记录的记录流。
 pub(crate) fn parse_directory_entries(
     directory: &RemotePath,
     output: &str,
 ) -> Result<Vec<RemoteFileEntry>, BridgeError> {
     let mut entries = Vec::new();
-    for record in output.split('\0') {
+    for record in output.split('\u{1e}') {
         if record.is_empty() {
             continue;
         }
-        let fields: Vec<&str> = record.split('\x1c').collect();
+        let fields: Vec<&str> = record.split('\u{1c}').collect();
         if fields.len() != 5 {
             continue;
         }
@@ -287,7 +290,7 @@ mod tests {
     #[test]
     fn parses_records_with_control_separators() {
         let dir = RemotePath::new("/data/local/tmp").unwrap();
-        let output = "d\x1Cetc\x1C4096\x1C1700000000\x1Cdrwxr-xr-x\x00f\x1Ca b.txt\x1C12\x1C1700000001\x1C-rw-r--r--\x00";
+        let output = "d\x1Cetc\x1C4096\x1C1700000000\x1Cdrwxr-xr-x\x1ef\x1Ca b.txt\x1C12\x1C1700000001\x1C-rw-r--r--\x1e";
         let entries = parse_directory_entries(&dir, output).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "etc");
@@ -303,7 +306,7 @@ mod tests {
     fn tolerates_partial_records() {
         let dir = RemotePath::new("/data").unwrap();
         let entries =
-            parse_directory_entries(&dir, "garbage\x00d\x1Cok\x1C1\x1C2\x1Cdrwx\x00\x00").unwrap();
+            parse_directory_entries(&dir, "garbage\x1ed\x1Cok\x1C1\x1C2\x1Cdrwx\x1e\x1e").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "ok");
     }

@@ -50,6 +50,8 @@ impl AppsState {
         self.confirm = None;
         self.install_note = None;
         self.last_load_attempt = None;
+        // 就地复位加载态,旧 target 的结果事件不再匹配。
+        self.loading = false;
     }
 
     pub fn maybe_auto_load(&mut self, ctx: &PanelCtx) -> Option<BackendCommand> {
