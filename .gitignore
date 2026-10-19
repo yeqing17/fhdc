@@ -2,7 +2,3 @@
 *.exe.old
 # 扫描工具新产出的报告先落根目录、暂不入库;定稿后归档到 docs/。
 /扫描建议-*.md
-
-# 图标试验产物不入库
-.logo-tmp/
-fhdc-logo-package.zip
