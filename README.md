@@ -74,6 +74,23 @@ cargo test --workspace
 cargo build --release -p fhdc
 ```
 
+## ❓ 常见问题
+
+**首次运行提示「Windows 已保护你的电脑 / 发布者未知」？**
+
+这是 Windows SmartScreen 对**未签名且没有下载信誉**的程序的标准提示,与应用本身无关。
+fhdc 的发布产物未做代码签名,从浏览器下载后会带「来自互联网」标记,首次运行即会触发:
+
+- 本机放行:点「更多信息 → 仍要运行」;或用 `Unblock-File .\fhdc-x.y.z.exe` 去掉标记;
+- 本地编译的 exe(`cargo build --release`)不带该标记,通常不会提示;
+- 想对**所有用户**彻底消除,只能做代码签名(EV 证书立即获得信誉,OV 证书需累积下载量);
+  自签名证书无效。
+
+**为什么 fadb 不弹?**
+
+SmartScreen 按「文件哈希 + 发布者」记信誉。fadb 发布得早、下载量足够大,已经积累了信誉;
+或者本机点过一次「仍要运行」(Windows 会记住该文件)。这不是 fadb 有特殊处理——同样未签名。
+
 ## 📄 许可
 
 MIT OR Apache-2.0
