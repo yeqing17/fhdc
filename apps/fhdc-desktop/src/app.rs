@@ -580,7 +580,8 @@ impl FhdcApp {
     fn brand(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             logo(ui, 22.0);
-            ui.label(egui::RichText::new("fhdc").strong().color(theme::ACCENT));
+            // 跟随前景色(深色主题下为白),不用主题蓝。
+            ui.label(egui::RichText::new("fhdc").strong());
         });
     }
 
@@ -895,9 +896,17 @@ impl FhdcApp {
                     .min_col_width(96.0)
                     .spacing([24.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("外观").strong());
-                        ui.label("");
-                        ui.end_row();
+                        // 分组标题独占一行,并在上方留出间距,避免与上一节
+                        // 的最后一行贴在一起。
+                        let section = |ui: &mut Ui, title: &str| {
+                            ui.vertical(|ui| {
+                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new(title).strong());
+                            });
+                            ui.label("");
+                            ui.end_row();
+                        };
+                        section(ui, "外观");
                         ui.label("主题");
                         ui.horizontal(|ui| {
                             if ui.selectable_label(!self.dark, "浅色").clicked() && self.dark {
@@ -915,9 +924,7 @@ impl FhdcApp {
                             self.restart_with_title_bar(native);
                         }
                         ui.end_row();
-                        ui.label(egui::RichText::new("hdc").strong());
-                        ui.label("");
-                        ui.end_row();
+                        section(ui, "hdc");
                         ui.label("当前状态");
                         ui.vertical(|ui| match &self.hdc_ready {
                             Some((path, version)) => {
@@ -946,9 +953,7 @@ impl FhdcApp {
                             );
                         }
                         ui.end_row();
-                        ui.label(egui::RichText::new("终端").strong());
-                        ui.label("");
-                        ui.end_row();
+                        section(ui, "终端");
                         ui.label("自动连接");
                         if ui
                             .checkbox(&mut self.terminal_auto_connect, "选中设备后自动打开终端")
@@ -957,9 +962,7 @@ impl FhdcApp {
                             self.shell.set_auto_connect(self.terminal_auto_connect);
                         }
                         ui.end_row();
-                        ui.label(egui::RichText::new("关于").strong());
-                        ui.label("");
-                        ui.end_row();
+                        section(ui, "关于");
                         ui.label("版本");
                         ui.label(env!("CARGO_PKG_VERSION"));
                         ui.end_row();
