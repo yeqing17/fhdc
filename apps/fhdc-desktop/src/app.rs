@@ -29,6 +29,7 @@ use crate::panels::overview::OverviewState;
 use crate::panels::processes::ProcessesState;
 use crate::panels::screenshot::ScreenshotState;
 use crate::panels::shell::ShellState;
+use crate::platform;
 use crate::runtime::RuntimeBridge;
 use crate::theme;
 
@@ -136,6 +137,10 @@ pub struct FhdcApp {
     nav_collapsed: bool,
     dark: bool,
     terminal_auto_connect: bool,
+    /// true = 使用 Windows 原生标题栏;false = 自绘标题栏(默认)。
+    native_titlebar: bool,
+    /// 本次指针按下是否已发出过 BeginResize(防止重复进入系统缩放循环)。
+    resize_sent: bool,
     windows: WindowFlags,
     toast: Option<Toast>,
     last_error: Option<BridgeError>,
@@ -152,7 +157,7 @@ pub struct FhdcApp {
 }
 
 impl FhdcApp {
-    pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(creation_context: &eframe::CreationContext<'_>, native_titlebar: bool) -> Self {
         theme::configure(&creation_context.egui_ctx);
         let storage = creation_context.storage;
         let active_panel = storage
@@ -199,6 +204,8 @@ impl FhdcApp {
             nav_collapsed,
             dark,
             terminal_auto_connect,
+            native_titlebar,
+            resize_sent: false,
             windows: WindowFlags::default(),
             toast: None,
             last_error: None,
@@ -511,12 +518,32 @@ impl FhdcApp {
     // 布局
     // ------------------------------------------------------------------
 
+    /// 顶栏同时充当窗口标题栏。
+    ///
+    /// 自绘标题栏模式下(默认),窗口是无边框的:拖动顶栏空白处移动
+    /// 窗口,双击切换最大化,窗口按钮(— □ ×)在右端;使用原生标题栏
+    /// 时,这些交互与按钮都交给系统。
     fn top_bar(&mut self, context: &Context) {
         TopBottomPanel::top("top-bar").show(context, |ui| {
-            ui.add_space(4.0);
+            // 先注册拖拽区,后添加的交互控件才能赢得命中测试、保持可点。
+            let title_bar = ui.interact(
+                ui.max_rect(),
+                ui.id().with("title-bar-drag"),
+                egui::Sense::drag(),
+            );
+            // 边缘拖拽区优先于标题栏拖拽:拖上边缘或上角应当缩放而非移动。
+            let custom_chrome = !self.native_titlebar;
+            if custom_chrome && title_bar.drag_started() && seam_direction(context).is_none() {
+                context.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if custom_chrome && title_bar.double_clicked() {
+                let maximized = context.input(|input| input.viewport().maximized.unwrap_or(false));
+                context.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+
+            ui.add_space(3.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("fhdc").strong().color(theme::ACCENT));
-                ui.label(egui::RichText::new("鸿蒙调试工具箱").small().weak());
+                self.brand(ui);
                 ui.separator();
                 self.device_selector(ui);
                 if ui.button("⟲ 刷新设备").clicked() {
@@ -535,14 +562,48 @@ impl FhdcApp {
                 if ui.selectable_label(self.windows.settings, "⚙").clicked() {
                     self.windows.settings = !self.windows.settings;
                 }
+                if custom_chrome {
+                    self.window_controls(ui, context);
+                }
             });
-            ui.add_space(4.0);
+            ui.add_space(3.0);
             if let Some(reason) = &self.hdc_unavailable {
                 ui.colored_label(
                     theme::palette(ui.visuals().dark_mode).warn,
                     format!("⚠ {reason}(当前使用假后端,可在设置中指定 hdc 路径)"),
                 );
             }
+        });
+    }
+
+    /// 左上角的 logo 与名称(与任务栏、exe 图标同一枚)。
+    fn brand(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            logo(ui, 22.0);
+            ui.label(egui::RichText::new("fhdc").strong().color(theme::ACCENT));
+        });
+    }
+
+    /// 窗口按钮(— □ ×),靠右端排列;关闭按钮悬停转 Windows 红。
+    fn window_controls(&mut self, ui: &mut Ui, context: &Context) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let bar_height = ui.available_height().max(18.0);
+            if close_button(ui, "关闭", bar_height).clicked() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            let maximized = context.input(|input| input.viewport().maximized.unwrap_or(false));
+            let (label, tip) = if maximized {
+                ("▣", "还原")
+            } else {
+                ("□", "最大化")
+            };
+            if caption_button(ui, label, tip, bar_height).clicked() {
+                context.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            if caption_button(ui, "—", "最小化", bar_height).clicked() {
+                context.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            ui.add_space(6.0);
         });
     }
 
@@ -847,6 +908,32 @@ impl FhdcApp {
                             }
                         });
                         ui.end_row();
+                        ui.label("标题栏");
+                        ui.vertical(|ui| {
+                            if ui
+                                .selectable_label(!self.native_titlebar, "应用自绘")
+                                .clicked()
+                                && self.native_titlebar
+                            {
+                                self.restart_with_title_bar(false);
+                            }
+                            if ui
+                                .selectable_label(self.native_titlebar, "Windows 原生")
+                                .clicked()
+                                && !self.native_titlebar
+                            {
+                                self.restart_with_title_bar(true);
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "「应用自绘」隐藏系统标题栏,由顶部工具栏兼任标题栏:\
+                                     拖动移动、双击最大化、右端为窗口按钮。切换会重启应用。",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
+                        ui.end_row();
                         ui.label(egui::RichText::new("hdc").strong());
                         ui.label("");
                         ui.end_row();
@@ -1049,6 +1136,34 @@ impl FhdcApp {
             context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(80.0, 80.0)));
         }
     }
+
+    /// 切换标题栏样式:保存选择,再带参数重启自己。
+    ///
+    /// eframe 只在创建窗口时决定窗口装饰,运行时的
+    /// `ViewportCommand::Decorations` 并不被处理,所以切换只能靠重启;
+    /// 命令行参数把新样式带进新进程,免得用户还要手动再选一次。
+    fn restart_with_title_bar(&mut self, native: bool) {
+        let style = if native {
+            platform::TitleBarStyle::Native
+        } else {
+            platform::TitleBarStyle::Custom
+        };
+        platform::save_title_bar_style(style);
+        let flag = if native {
+            "--native-titlebar"
+        } else {
+            "--custom-titlebar"
+        };
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        match std::process::Command::new(exe).arg(flag).spawn() {
+            Ok(_) => std::process::exit(0),
+            Err(error) => {
+                self.show_toast(format!("重启失败: {error}"));
+            }
+        }
+    }
 }
 
 impl eframe::App for FhdcApp {
@@ -1060,6 +1175,10 @@ impl eframe::App for FhdcApp {
         }
         self.auto_behaviors(context);
         self.top_bar(context);
+        // 无边框窗口没有系统缩放边框,自己补上边缘拖拽区。
+        if !self.native_titlebar {
+            handle_window_resize(context, &mut self.resize_sent);
+        }
         self.side_bar(context);
         self.central_panel(context);
         self.device_manager(context);
@@ -1117,9 +1236,144 @@ fn apply_pending_update() -> Result<(), String> {
     }
 }
 
-pub fn viewport_builder() -> ViewportBuilder {
+/// 窗口初始一律无边框;若用户选择原生标题栏,首帧再切回去
+/// (eframe 拿不到窗口创建前的持久化设置)。
+pub fn viewport_builder(native_titlebar: bool) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title("fhdc — 鸿蒙调试工具箱")
+        .with_decorations(native_titlebar)
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([900.0, 600.0])
+}
+
+/// 顶栏 logo:与任务栏、exe 图标同一枚,解码一次后缓存为纹理。
+fn logo(ui: &mut Ui, size: f32) -> egui::Response {
+    let texture = logo_texture(ui.ctx());
+    ui.add(
+        egui::Image::from_texture(&texture)
+            .max_size(egui::vec2(size, size))
+            .corner_radius(size * 0.22),
+    )
+}
+
+fn logo_texture(ctx: &Context) -> egui::TextureHandle {
+    let logo_id = egui::Id::new("fhdc-logo");
+    if let Some(handle) = ctx.data_mut(|cache| cache.get_temp::<egui::TextureHandle>(logo_id)) {
+        return handle;
+    }
+    let img = image::load_from_memory(include_bytes!("../assets/icon-64.png"))
+        .expect("内嵌 logo 是有效 PNG")
+        .to_rgba8();
+    let [width, height] = [img.width() as usize, img.height() as usize];
+    let handle = ctx.load_texture(
+        "fhdc-logo",
+        egui::ColorImage::from_rgba_unmultiplied([width, height], img.as_raw()),
+        egui::TextureOptions::default(),
+    );
+    ctx.data_mut(|cache| cache.insert_temp(logo_id, handle.clone()));
+    handle
+}
+
+/// 窗口按钮:字形避开 Dingbats 区段(✕/❐ 在内置字体里是豆腐块),
+/// × 与 ▣ 在拉丁与中文回退字体里都有。
+fn caption_button(ui: &mut Ui, label: &str, tooltip: &str, bar_height: f32) -> egui::Response {
+    ui.add_sized(
+        [bar_height * 1.6, bar_height],
+        egui::Button::new(egui::RichText::new(label).size(13.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+/// 关闭按钮:悬停转 Windows 风格的红底白字。
+fn close_button(ui: &mut Ui, tooltip: &str, bar_height: f32) -> egui::Response {
+    ui.scope(|ui| {
+        let widgets = &mut ui.style_mut().visuals.widgets;
+        widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(196, 44, 52);
+        widgets.hovered.bg_stroke = egui::Stroke::NONE;
+        widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+        widgets.active.weak_bg_fill = egui::Color32::from_rgb(224, 54, 62);
+        widgets.active.bg_stroke = egui::Stroke::NONE;
+        ui.add_sized(
+            [bar_height * 1.6, bar_height],
+            egui::Button::new(egui::RichText::new("×").size(13.0)),
+        )
+        .on_hover_text(tooltip)
+    })
+    .inner
+}
+
+/// 无边框窗口没有系统的缩放边框,用窗口边缘的隐形拖拽区补上。
+///
+/// 一次按下只发一次 BeginResize:系统缩放循环退出时,winit 会补发一个
+/// 按钮抬起事件,egui 可能晚一帧才看到;无条件重发会带着已松开的按钮
+/// 立刻再次进入缩放循环(窗口卡在缩放状态)。
+fn handle_window_resize(context: &Context, resize_sent: &mut bool) {
+    let Some(direction) = seam_direction(context) else {
+        return;
+    };
+    context.set_cursor_icon(seam_cursor(direction));
+    let (dragging, primary_down) = context.input(|input| {
+        (
+            input.pointer.is_decidedly_dragging(),
+            input.pointer.primary_down(),
+        )
+    });
+    // 只在手势确实在拖动时闩住;一旦不在拖动(按钮抬起,或按下但未移动)
+    // 就清掉闩锁,被吞掉的发送不会污染后续手势。
+    if !primary_down || !dragging {
+        *resize_sent = false;
+        return;
+    }
+    if !*resize_sent {
+        *resize_sent = true;
+        context.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+    }
+}
+
+/// 指针当前落在哪条缩放边上。
+fn seam_direction(context: &Context) -> Option<egui::ResizeDirection> {
+    if context.input(|input| input.viewport().maximized.unwrap_or(false)) {
+        return None;
+    }
+    context
+        .pointer_hover_pos()
+        .and_then(|pos| resize_direction(pos, context.content_rect()))
+}
+
+/// 缩放边的隐形厚度(点)。
+const RESIZE_SEAM_THICKNESS: f32 = 8.0;
+
+fn resize_direction(pointer: egui::Pos2, content: egui::Rect) -> Option<egui::ResizeDirection> {
+    let rect = content.expand2(egui::vec2(RESIZE_SEAM_THICKNESS, RESIZE_SEAM_THICKNESS));
+    if !rect.contains(pointer) {
+        return None;
+    }
+    let left = pointer.x - content.left() < RESIZE_SEAM_THICKNESS;
+    let right = content.right() - pointer.x < RESIZE_SEAM_THICKNESS;
+    let top = pointer.y - content.top() < RESIZE_SEAM_THICKNESS;
+    let bottom = content.bottom() - pointer.y < RESIZE_SEAM_THICKNESS;
+    match (left, right, top, bottom) {
+        (true, false, true, false) => Some(egui::ResizeDirection::NorthWest),
+        (false, true, true, false) => Some(egui::ResizeDirection::NorthEast),
+        (true, false, false, true) => Some(egui::ResizeDirection::SouthWest),
+        (false, true, false, true) => Some(egui::ResizeDirection::SouthEast),
+        (true, false, false, false) => Some(egui::ResizeDirection::West),
+        (false, true, false, false) => Some(egui::ResizeDirection::East),
+        (false, false, true, false) => Some(egui::ResizeDirection::North),
+        (false, false, false, true) => Some(egui::ResizeDirection::South),
+        _ => None,
+    }
+}
+
+fn seam_cursor(direction: egui::ResizeDirection) -> egui::CursorIcon {
+    match direction {
+        egui::ResizeDirection::North => egui::CursorIcon::ResizeNorth,
+        egui::ResizeDirection::South => egui::CursorIcon::ResizeSouth,
+        egui::ResizeDirection::East => egui::CursorIcon::ResizeEast,
+        egui::ResizeDirection::West => egui::CursorIcon::ResizeWest,
+        egui::ResizeDirection::NorthEast => egui::CursorIcon::ResizeNorthEast,
+        egui::ResizeDirection::NorthWest => egui::CursorIcon::ResizeNorthWest,
+        egui::ResizeDirection::SouthEast => egui::CursorIcon::ResizeSouthEast,
+        egui::ResizeDirection::SouthWest => egui::CursorIcon::ResizeSouthWest,
+    }
 }

@@ -4,6 +4,7 @@
 
 mod app;
 mod panels;
+mod platform;
 mod quick_commands;
 mod runtime;
 mod theme;
@@ -32,6 +33,12 @@ fn main() -> eframe::Result<()> {
         let _ = std::fs::remove_file(exe.with_extension("exe.old"));
     }
 
+    // 窗口装饰必须在窗口创建前定下来:命令行参数优先,其次是上次保存
+    // 的选择,默认自绘标题栏。
+    let title_bar =
+        platform::title_bar_style_from_args().unwrap_or_else(platform::load_title_bar_style);
+    let native_titlebar = title_bar == platform::TitleBarStyle::Native;
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("fhdc=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -39,12 +46,19 @@ fn main() -> eframe::Result<()> {
         .init();
 
     let options = eframe::NativeOptions {
-        viewport: app::viewport_builder().with_icon(app_icon()),
+        viewport: app::viewport_builder(native_titlebar).with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
         "fhdc",
         options,
-        Box::new(|creation_context| Ok(Box::new(app::FhdcApp::new(creation_context)))),
+        Box::new(|creation_context| {
+            // 无边框窗口在 Windows 上是尖角且没有投影,交给 DWM 修正。
+            platform::apply_window_chrome(creation_context);
+            Ok(Box::new(app::FhdcApp::new(
+                creation_context,
+                native_titlebar,
+            )))
+        }),
     )
 }
