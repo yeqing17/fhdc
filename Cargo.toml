@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
@@ -32,10 +32,14 @@ serde_json = "1.0.145"
 thiserror = "2.0.17"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
+# 终端面板的 VT 网格解析与渲染。
+vt100 = "0.16.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 semver = "1.0.28"
+# HAP 是 zip 容器:最小 zip 读取器 + inflate 解出应用图标。
+flate2 = "1.1"
 sha2 = "0.10.9"
 # "system-proxy" 读取系统代理设置,自升级下载才能走用户配置的代理。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "system-proxy"] }

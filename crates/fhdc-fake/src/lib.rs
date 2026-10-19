@@ -11,9 +11,10 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use fhdc_domain::{
-    AppAction, BridgeError, BundleDetails, BundleName, BundleRecord, ConnectKey, DeviceDescriptor,
-    DeviceOverview, DeviceState, Endpoint, ErrorCode, OverwritePolicy, ProcessInfo,
-    RemoteFileEntry, RemoteFileKind, RemotePath, ShellOutputChunk, ShellStream,
+    AppAction, BridgeError, BundleDetails, BundleName, BundlePackage, BundleRecord, ConnectKey,
+    DeviceDescriptor, DeviceOverview, DeviceState, Endpoint, ErrorCode, OverwritePolicy,
+    ProcessInfo, RemoteFileEntry, RemoteFileKind, RemotePath, ShellOutputChunk, ShellSize,
+    ShellStream,
 };
 use fhdc_hdc::HdcTransport;
 use fhdc_hdc::ShellSessionHandle;
@@ -246,6 +247,15 @@ impl HdcTransport for FakeHdcTransport {
         Ok(self.state.lock().await.bundles.clone())
     }
 
+    async fn list_bundle_packages(
+        &self,
+        key: &ConnectKey,
+    ) -> Result<Vec<BundlePackage>, BridgeError> {
+        self.require_key(key).await?;
+        // 假后端没有安装物,返回空清单;图标加载会立即结束。
+        Ok(Vec::new())
+    }
+
     async fn bundle_details(
         &self,
         key: &ConnectKey,
@@ -313,7 +323,11 @@ impl HdcTransport for FakeHdcTransport {
         Ok("install bundle successfully. (fake)".to_owned())
     }
 
-    async fn start_shell(&self, key: &ConnectKey) -> Result<ShellSessionHandle, BridgeError> {
+    async fn start_shell(
+        &self,
+        key: &ConnectKey,
+        _size: ShellSize,
+    ) -> Result<ShellSessionHandle, BridgeError> {
         self.require_key(key).await?;
         // 克隆共享同一份内存状态,否则 default() 的空状态会让假终端
         // 查不到包列表等数据。

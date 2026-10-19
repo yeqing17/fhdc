@@ -314,6 +314,34 @@ pub struct BundleRecord {
     pub system: bool,
 }
 
+/// 一个包的一个安装物(HAP)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleHap {
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified_unix_seconds: u64,
+}
+
+/// 一个包的安装信息:本地化名称与全部 HAP。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundlePackage {
+    pub bundle: BundleName,
+    /// `bm dump -l` 给出的本地化名称;可能为空。
+    pub label: Option<String>,
+    pub haps: Vec<BundleHap>,
+}
+
+impl BundlePackage {
+    /// 图标缓存指纹:HAP 大小与修改时间的组合,包升级后自动失效。
+    pub fn stamp(&self) -> String {
+        self.haps
+            .iter()
+            .map(|hap| format!("{}-{}", hap.size_bytes, hap.modified_unix_seconds))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleDetails {
     pub name: BundleName,
@@ -432,6 +460,30 @@ pub struct ShellOutputChunk {
     pub bytes: Vec<u8>,
 }
 
+/// 交互式终端的行列尺寸,会话建立时传给设备端一次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellSize {
+    columns: u16,
+    rows: u16,
+}
+
+impl ShellSize {
+    pub fn new(columns: u16, rows: u16) -> Result<Self, BridgeError> {
+        if columns == 0 || rows == 0 {
+            return Err(BridgeError::invalid_input("终端行列数必须大于 0"));
+        }
+        Ok(Self { columns, rows })
+    }
+
+    pub const fn columns(self) -> u16 {
+        self.columns
+    }
+
+    pub const fn rows(self) -> u16 {
+        self.rows
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 应用更新
 // ---------------------------------------------------------------------------
@@ -473,6 +525,13 @@ pub enum BackendCommand {
     LoadProcesses(DeviceTarget),
     LoadBundles(DeviceTarget),
     LoadBundleDetails(DeviceTarget, BundleName),
+    /// 批量枚举包与 HAP,逐个加载图标(带本地缓存)。
+    LoadBundleIcons(DeviceTarget),
+    /// 单个包的按需图标加载(批量阶段跳过大包时由选中动作触发)。
+    LoadBundleIcon {
+        target: DeviceTarget,
+        package: BundlePackage,
+    },
     RunAppAction {
         target: DeviceTarget,
         bundle: BundleName,
@@ -482,6 +541,7 @@ pub enum BackendCommand {
     OpenShell {
         target: DeviceTarget,
         session: SessionId,
+        size: ShellSize,
     },
     WriteShell {
         session: SessionId,
@@ -587,6 +647,14 @@ pub enum BackendEvent {
     BundlesLoading(DeviceTarget),
     BundlesLoaded(DeviceTarget, Vec<BundleRecord>),
     BundlesFailed(DeviceTarget, BridgeError),
+    /// 图标加载:先给出包清单(含本地化名称与 HAP 路径),随后逐个给图标。
+    BundlePackagesLoaded(DeviceTarget, Vec<BundlePackage>),
+    BundlePackagesFailed(DeviceTarget, BridgeError),
+    /// 单个包的图标字节(PNG/JPEG/WebP);None 表示该包没有可用图标。
+    BundleIconLoaded(DeviceTarget, BundleName, Option<Vec<u8>>),
+    /// 批量阶段跳过了超大 HAP;选中该包时可再按需拉取。
+    BundleIconSkipped(DeviceTarget, BundleName),
+    BundleIconsFinished(DeviceTarget),
     BundleDetailsLoading(DeviceTarget, BundleName),
     BundleDetailsLoaded(DeviceTarget, BundleDetails),
     BundleDetailsFailed(DeviceTarget, BundleName, BridgeError),

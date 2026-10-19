@@ -18,3 +18,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# hdc 的交互式 shell 需要 host 侧伪控制台(ConPTY/openpty):
+# 管道 stdin 下 hdc 不消费输入,只有真控制台才进 TTY 模式。
+portable-pty = "0.8"
+# 解 HAP(zip 容器)里的应用图标。
+flate2.workspace = true

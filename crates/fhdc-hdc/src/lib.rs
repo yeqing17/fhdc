@@ -4,10 +4,12 @@
 //! 假后端(fhdc-fake)实现同一 trait 供无设备开发使用。
 
 mod files;
+mod hap_icon;
 mod hilog;
 mod process;
 mod shell;
 
+pub use hap_icon::extract_hap_icon;
 pub use shell::ShellSessionHandle;
 
 use std::env;
@@ -20,8 +22,9 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use fhdc_domain::{
-    AppAction, BridgeError, BundleDetails, BundleName, BundleRecord, ConnectKey, DeviceDescriptor,
-    DeviceOverview, DeviceState, Endpoint, ErrorCode, OverwritePolicy, ProcessInfo, RemotePath,
+    AppAction, BridgeError, BundleDetails, BundleHap, BundleName, BundlePackage, BundleRecord,
+    ConnectKey, DeviceDescriptor, DeviceOverview, DeviceState, Endpoint, ErrorCode,
+    OverwritePolicy, ProcessInfo, RemotePath, ShellSize,
 };
 
 /// 单命令默认超时。
@@ -30,6 +33,37 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
 const DEFAULT_OUTPUT_LIMIT: usize = fhdc_domain::MAX_OUTPUT_BYTES;
 /// 安装 HAP 的超时。
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// 枚举全部包(每包一次 bm dump -l)是慢命令,单独给更长的超时。
+const PACKAGES_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 设备端枚举脚本:输出 `bundle\034label\034size\034mtime\034hap\036` 记录流。
+const BUNDLE_PACKAGES_SCRIPT: &str = r#"for b in $(bm dump -a 2>/dev/null | sed -n 's/^[[:space:]]*//p' | grep -v '^ID:' | grep -v '^$'); do
+  label=''
+  found=0
+  for root in /data/app/el1/bundle/public /system/app; do
+    d="$root/$b"
+    [ -d "$d" ] || continue
+    if [ "$found" = 0 ]; then
+      label=$(bm dump -n "$b" -l 2>/dev/null | head -1)
+      found=1
+    fi
+    for hap in "$d"/*.hap; do
+      [ -f "$hap" ] || continue
+      set -- $(stat -c '%s %Y' "$hap" 2>/dev/null || echo '0 0')
+      printf '%s\034%s\034%s\034%s\034%s\036' "$b" "$label" "$1" "$2" "$hap"
+    done
+  done
+  if [ "$found" = 0 ]; then
+    cp=$(bm dump -n "$b" 2>/dev/null | sed -n 's/.*"codePath": "\([^"]*\)".*/\1/p' | head -1)
+    label=$(bm dump -n "$b" -l 2>/dev/null | head -1)
+    [ -n "$cp" ] || continue
+    for hap in "$cp"/*.hap; do
+      [ -f "$hap" ] || continue
+      set -- $(stat -c '%s %Y' "$hap" 2>/dev/null || echo '0 0')
+      printf '%s\034%s\034%s\034%s\034%s\036' "$b" "$label" "$1" "$2" "$hap"
+    done
+  fi
+done"#;
 /// 截图流水线各步超时。
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 截图字节上限。
@@ -49,6 +83,11 @@ pub trait HdcTransport: Send + Sync {
     async fn list_processes(&self, key: &ConnectKey) -> Result<Vec<ProcessInfo>, BridgeError>;
 
     async fn list_bundles(&self, key: &ConnectKey) -> Result<Vec<BundleRecord>, BridgeError>;
+    /// 枚举所有包的安装物(HAP 路径 + 本地化名称),供图标加载使用。
+    async fn list_bundle_packages(
+        &self,
+        key: &ConnectKey,
+    ) -> Result<Vec<BundlePackage>, BridgeError>;
     async fn bundle_details(
         &self,
         key: &ConnectKey,
@@ -62,7 +101,11 @@ pub trait HdcTransport: Send + Sync {
     ) -> Result<String, BridgeError>;
     async fn install_hap(&self, key: &ConnectKey, path: &Path) -> Result<String, BridgeError>;
 
-    async fn start_shell(&self, key: &ConnectKey) -> Result<ShellSessionHandle, BridgeError>;
+    async fn start_shell(
+        &self,
+        key: &ConnectKey,
+        size: ShellSize,
+    ) -> Result<ShellSessionHandle, BridgeError>;
     async fn start_hilog(&self, key: &ConnectKey) -> Result<ShellSessionHandle, BridgeError>;
     async fn clear_hilog(&self, key: &ConnectKey) -> Result<(), BridgeError>;
     /// 一次性执行设备端命令并返回文本输出。
@@ -323,7 +366,8 @@ impl HdcTransport for ProcessHdcTransport {
             ])
             .await?;
         let trimmed = output.trim();
-        if trimmed.to_lowercase().contains("[fail]") || trimmed.to_lowercase().contains("error") {
+        let lowered = trimmed.to_lowercase();
+        if output_failed(&lowered) {
             return Err(BridgeError::hdc(format!("连接失败: {trimmed}")));
         }
         Ok(trimmed.to_owned())
@@ -337,7 +381,7 @@ impl HdcTransport for ProcessHdcTransport {
             ])
             .await?;
         let trimmed = output.trim();
-        if trimmed.to_lowercase().contains("[fail]") {
+        if output_failed(&trimmed.to_lowercase()) {
             return Err(BridgeError::hdc(format!("断开失败: {trimmed}")));
         }
         Ok(trimmed.to_owned())
@@ -412,6 +456,36 @@ impl HdcTransport for ProcessHdcTransport {
         Ok(parse_bundles(&output))
     }
 
+    async fn list_bundle_packages(
+        &self,
+        key: &ConnectKey,
+    ) -> Result<Vec<BundlePackage>, BridgeError> {
+        // 一次 shell 跑完枚举:每个包一次 bm dump -l 拿本地化名称
+        // (约 0.1s/包),再逐个 HAP 取大小与 mtime 作缓存指纹。
+        let output = process::run_bounded(
+            &self.executable,
+            vec![
+                OsString::from("-t"),
+                OsString::from(key.as_str()),
+                OsString::from("shell"),
+                OsString::from(BUNDLE_PACKAGES_SCRIPT),
+            ],
+            PACKAGES_TIMEOUT,
+            self.max_output_bytes,
+            self.max_output_bytes,
+        )
+        .await?;
+        if output.exit_code != Some(0) {
+            return Err(BridgeError::new(
+                ErrorCode::HdcFailed,
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        Ok(parse_bundle_packages(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
     async fn bundle_details(
         &self,
         key: &ConnectKey,
@@ -452,7 +526,9 @@ impl HdcTransport for ProcessHdcTransport {
                     ])
                     .await?;
                 let trimmed = output.trim();
-                if trimmed.to_lowercase().contains("[fail]") {
+                // 卸载失败时 hdc 退出码仍为 0,报错文本形如
+                // "msg:error: failed to uninstall bundle."。
+                if output_failed(&trimmed.to_lowercase()) {
                     return Err(BridgeError::hdc(format!("卸载失败: {trimmed}")));
                 }
                 return Ok(trimmed.to_owned());
@@ -460,7 +536,7 @@ impl HdcTransport for ProcessHdcTransport {
         };
         let output = self.shell_text(key, &command).await?;
         let trimmed = output.trim();
-        if trimmed.to_lowercase().contains("[fail]") {
+        if output_failed(&trimmed.to_lowercase()) {
             return Err(BridgeError::hdc(format!("操作失败: {trimmed}")));
         }
         Ok(if trimmed.is_empty() {
@@ -486,12 +562,11 @@ impl HdcTransport for ProcessHdcTransport {
         .await?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let combined = format!("{stdout} {stderr}").to_lowercase();
-        let success_words = ["success", "finish", "完成"];
-        // 失败词刻意收紧:"error" 单词太宽(如 "0 errors" 也会误中)。
-        let failed = combined.contains("[fail]") || combined.contains("failure");
+        // 实测(3.2.0d)失败的安装也退出 0,报错在文本里:
+        // "msg:error: failed to install bundle. code:9568320 error: no signature file."
+        // 成功输出只含 "install bundle successfully" / "AppMod finish",不含 error。
         if output.exit_code == Some(0)
-            && (!failed || success_words.iter().any(|word| combined.contains(word)))
+            && !output_failed(&format!("{stdout} {stderr}").to_lowercase())
         {
             return Ok(if stdout.is_empty() {
                 "安装完成".to_owned()
@@ -505,8 +580,12 @@ impl HdcTransport for ProcessHdcTransport {
         )))
     }
 
-    async fn start_shell(&self, key: &ConnectKey) -> Result<ShellSessionHandle, BridgeError> {
-        shell::start_shell(self.executable.clone(), key)
+    async fn start_shell(
+        &self,
+        key: &ConnectKey,
+        size: ShellSize,
+    ) -> Result<ShellSessionHandle, BridgeError> {
+        shell::start_shell(self.executable.clone(), key, size)
     }
 
     async fn start_hilog(&self, key: &ConnectKey) -> Result<ShellSessionHandle, BridgeError> {
@@ -574,10 +653,18 @@ impl HdcTransport for ProcessHdcTransport {
 
     async fn capture_screenshot(&self, key: &ConnectKey) -> Result<Vec<u8>, BridgeError> {
         let remote = "/data/local/tmp/fhdc_screen.jpeg";
-        self.shell_optional(key, &format!("snapshot_display -f {remote}"))
-            .await
-            .filter(|code| *code == 0)
-            .ok_or_else(|| BridgeError::hdc("snapshot_display 截图失败(设备可能不支持)"))?;
+        // snapshot_display 失败(路径非法/不支持)时退出码仍为 0,且成功输出
+        // 恒含 "success: snapshot display";文本判定才可靠。
+        let snap = self
+            .shell_text(key, &format!("snapshot_display -f {remote}"))
+            .await?;
+        let snap_lower = snap.to_lowercase();
+        if snap_lower.contains("error") || !snap_lower.contains("success") {
+            return Err(BridgeError::hdc(format!(
+                "snapshot_display 截图失败(设备可能不支持): {}",
+                snap.trim().lines().next_back().unwrap_or_default()
+            )));
+        }
 
         let local = std::env::temp_dir().join(format!(
             "fhdc_screen_{}.jpeg",
@@ -601,7 +688,14 @@ impl HdcTransport for ProcessHdcTransport {
         let cleanup_remote = self.shell_optional(key, &format!("rm -f {remote}")).await;
         let _ = cleanup_remote;
         let output = recv?;
-        if output.exit_code != Some(0) {
+        // file recv 失败(远端不存在)时退出码也是 0,靠 [Fail]/error 文本判定。
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .to_lowercase();
+        if output.exit_code != Some(0) || output_failed(&combined) {
             return Err(BridgeError::hdc(format!(
                 "拉取截图失败: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -716,6 +810,41 @@ fn looks_like_bundle(line: &str) -> bool {
         && line.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
 }
 
+/// 解析枚举脚本的 `bundle\034label\034size\034mtime\034hap\036` 记录流。
+pub(crate) fn parse_bundle_packages(output: &str) -> Vec<BundlePackage> {
+    let mut packages: Vec<BundlePackage> = Vec::new();
+    for record in output.split('\u{1e}') {
+        if record.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = record.split('\u{1c}').collect();
+        if fields.len() != 5 {
+            continue;
+        }
+        let Ok(bundle) = BundleName::new(fields[0].trim()) else {
+            continue;
+        };
+        let label = fields[1].trim();
+        let hap = BundleHap {
+            path: fields[4].trim().to_owned(),
+            size_bytes: fields[2].trim().parse().unwrap_or(0),
+            modified_unix_seconds: fields[3].trim().parse().unwrap_or(0),
+        };
+        if hap.path.is_empty() {
+            continue;
+        }
+        match packages.iter_mut().find(|package| package.bundle == bundle) {
+            Some(existing) => existing.haps.push(hap),
+            None => packages.push(BundlePackage {
+                bundle,
+                label: (!label.is_empty()).then(|| label.to_owned()),
+                haps: vec![hap],
+            }),
+        }
+    }
+    packages
+}
+
 /// 解析 `bm dump -a` 的包名列表(容忍标题行)。
 pub(crate) fn parse_bundles(output: &str) -> Vec<BundleRecord> {
     let mut names: Vec<BundleName> = output
@@ -733,6 +862,13 @@ pub(crate) fn parse_bundles(output: &str) -> Vec<BundleRecord> {
             name,
         })
         .collect()
+}
+
+/// hdc 的退出码不区分成败(实测 3.2.0d 失败也退出 0),文本标记是唯一依据。
+/// "error" 单独用作失败词只在安装/卸载/aa/bm 这类输出上使用——它们的
+/// 成功输出不含该词;注意不要推广到任意命令。
+pub(crate) fn output_failed(lowered: &str) -> bool {
+    lowered.contains("[fail]") || lowered.contains("error") || lowered.contains("failure")
 }
 
 /// 解析 `bm dump -n <bundle>` 的详情:优先 JSON,退化为键值扫描。
@@ -757,7 +893,13 @@ pub(crate) fn parse_bundle_details(
         update_time: None,
         system: None,
     };
-    let parsed: Option<serde_json::Value> = serde_json::from_str(trimmed).ok();
+    // 真机(3.2.0d)输出以 `包名:` 前缀行开头,JSON 从首个 `{`/`[` 起;
+    // 切片后兼容前缀与无前缀两种形态。
+    let json_body = trimmed
+        .find(['{', '['])
+        .map(|index| &trimmed[index..])
+        .unwrap_or(trimmed);
+    let parsed: Option<serde_json::Value> = serde_json::from_str(json_body).ok();
     let object = match parsed {
         Some(serde_json::Value::Array(items)) => items.into_iter().next(),
         Some(value @ serde_json::Value::Object(_)) => Some(value),
@@ -768,19 +910,37 @@ pub(crate) fn parse_bundle_details(
         let number = |key: &str| map.get(key).and_then(|v| v.as_f64()).map(|v| v.to_string());
         details.version_name = text("versionName");
         details.version_code = number("versionCode").or_else(|| text("versionCode"));
-        details.main_ability = text("mainAbility").or_else(|| text("entryAbility"));
+        details.main_ability = text("mainAbility")
+            .or_else(|| text("entryAbility"))
+            .or_else(|| {
+                // 真机根层没有 mainAbility,在 hapModuleInfos[0] 里。
+                map.get("hapModuleInfos")
+                    .and_then(|v| v.as_array())
+                    .and_then(|items| items.first())
+                    .and_then(|module| module.get("mainAbility"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            });
         details.app_id = text("appId").or_else(|| text("appIdentifier"));
         details.install_time = number("installTime").or_else(|| text("installTime"));
         details.update_time = number("updateTime").or_else(|| text("updateTime"));
-        details.system = map.get("isSystemApp").and_then(|v| v.as_bool());
+        // 真机根层没有 isSystemApp,在 applicationInfo 里。
+        details.system = map
+            .get("isSystemApp")
+            .and_then(|v| v.as_bool())
+            .or_else(|| {
+                map.get("applicationInfo")
+                    .and_then(|v| v.get("isSystemApp"))
+                    .and_then(|v| v.as_bool())
+            });
         return Ok(details);
     }
-    // 退化为 `key: value` 行扫描(旧版本纯文本输出)。
+    // 退化为 `key: value` 行扫描(旧版本纯文本输出;容忍 JSON 风格的引号键)。
     for line in trimmed.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        let key = key.trim().to_lowercase();
+        let key = key.trim().trim_matches('"').to_lowercase();
         let value = value.trim().trim_matches('"').to_owned();
         match key.as_str() {
             "versionname" => details.version_name = Some(value),
@@ -870,5 +1030,56 @@ mod tests {
             parse_bundle_details("[Fail]BusMana error", BundleName::new("com.x.y").unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn bundle_details_handles_device_prefix_and_nested_fields() {
+        // 真机 3.2.0d:首行是 `包名:` 前缀;根层没有 mainAbility 与
+        // isSystemApp,分别在 hapModuleInfos[0] 与 applicationInfo 里。
+        let device = r#"com.ohos.camera:
+{
+    "appId": "com.ohos.camera_BAjVq",
+    "appIdentifier": "",
+    "applicationInfo": {
+        "isSystemApp": true,
+        "versionCode": 50000110,
+        "versionName": "5.0.0.110"
+    },
+    "hapModuleInfos": [
+        {
+            "mainAbility": "com.ohos.camera.MainAbility",
+            "name": "entry"
+        }
+    ],
+    "installTime": 20828,
+    "updateTime": 20828,
+    "versionCode": 50000110,
+    "versionName": "5.0.0.110"
+}"#;
+        let details =
+            parse_bundle_details(device, BundleName::new("com.ohos.camera").unwrap()).unwrap();
+        assert_eq!(details.version_name.as_deref(), Some("5.0.0.110"));
+        assert_eq!(details.version_code.as_deref(), Some("50000110"));
+        assert_eq!(
+            details.main_ability.as_deref(),
+            Some("com.ohos.camera.MainAbility")
+        );
+        assert_eq!(details.system, Some(true));
+        assert_eq!(details.install_time.as_deref(), Some("20828"));
+    }
+
+    #[test]
+    fn output_failure_detection() {
+        assert!(output_failed(
+            "[info]... msg:error: failed to install bundle."
+        ));
+        assert!(output_failed("[fail]error opening file"));
+        assert!(output_failed("operation failure"));
+        assert!(!output_failed("install bundle successfully. appmod finish"));
+        // 防回归:成功输出不能因普通词误判。
+        assert!(!output_failed(
+            "FileTransfer finish, Size:45235, File count = 1"
+        ));
+        assert!(!output_failed("start ability successfully."));
     }
 }

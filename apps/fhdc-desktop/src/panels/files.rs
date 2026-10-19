@@ -21,7 +21,6 @@ use crate::theme;
 
 use super::Commands;
 use super::PanelCtx;
-use super::overview::format_kib;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SortKey {
@@ -375,7 +374,7 @@ impl FilesState {
                             ui.label(egui::RichText::new(kind_text).small().weak());
                             ui.label(
                                 egui::RichText::new(
-                                    entry.size_bytes.map(format_kib).unwrap_or_default(),
+                                    entry.size_bytes.map(format_bytes).unwrap_or_default(),
                                 )
                                 .small()
                                 .monospace(),
@@ -736,9 +735,34 @@ fn error_code_text(code: fhdc_domain::ErrorCode) -> &'static str {
     }
 }
 
+/// 字节值的可读格式。设备的 `stat -c %s` 给的是字节;不要与概览的
+/// format_kib(输入是 KiB)混用,否则单位整体升一级(44 KiB 显示成 MiB)。
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if (bytes as f64) >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else if (bytes as f64) >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if (bytes as f64) >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_size_formatting() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(45235), "44.2 KiB");
+        assert_eq!(format_bytes(1_788_051), "1.7 MiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
 
     #[test]
     fn mtime_formatting() {

@@ -13,8 +13,8 @@ use std::time::Duration;
 use eframe::egui::Context;
 use fhdc_device::DeviceRegistry;
 use fhdc_domain::{
-    AppAction, BackendCommand, BackendEvent, BridgeError, DeviceTarget, ErrorCode, OperationId,
-    SessionId,
+    AppAction, BackendCommand, BackendEvent, BridgeError, BundleName, BundlePackage, DeviceTarget,
+    ErrorCode, OperationId, OverwritePolicy, RemotePath, SessionId,
 };
 use fhdc_hdc::HdcTransport;
 use fhdc_hdc::ShellSessionHandle;
@@ -427,6 +427,103 @@ async fn run_backend(
                     .await;
                 }
             }
+            BackendCommand::LoadBundleIcons(target) => {
+                if ensure_target(&registry, &target) {
+                    let transport = Arc::clone(&transport);
+                    let event_tx = event_tx.clone();
+                    let context = context.clone();
+                    tokio::spawn(async move {
+                        let packages = match transport.list_bundle_packages(&target.key).await {
+                            Ok(packages) => packages,
+                            Err(error) => {
+                                send_event(
+                                    &event_tx,
+                                    &context,
+                                    BackendEvent::BundlePackagesFailed(target, error),
+                                )
+                                .await;
+                                return;
+                            }
+                        };
+                        send_event(
+                            &event_tx,
+                            &context,
+                            BackendEvent::BundlePackagesLoaded(target.clone(), packages.clone()),
+                        )
+                        .await;
+                        // 小包优先:图标逐个出现,常见应用不必等大包。
+                        let mut order: Vec<usize> = (0..packages.len()).collect();
+                        order.sort_by_key(|&index| {
+                            packages[index]
+                                .haps
+                                .iter()
+                                .map(|hap| hap.size_bytes)
+                                .min()
+                                .unwrap_or(u64::MAX)
+                        });
+                        for index in order {
+                            let package = &packages[index];
+                            let event = match fetch_bundle_icon(&transport, &target, package, false)
+                                .await
+                            {
+                                IconOutcome::Icon(bytes) => BackendEvent::BundleIconLoaded(
+                                    target.clone(),
+                                    package.bundle.clone(),
+                                    Some(bytes),
+                                ),
+                                IconOutcome::Missing => BackendEvent::BundleIconLoaded(
+                                    target.clone(),
+                                    package.bundle.clone(),
+                                    None,
+                                ),
+                                IconOutcome::Skipped => BackendEvent::BundleIconSkipped(
+                                    target.clone(),
+                                    package.bundle.clone(),
+                                ),
+                            };
+                            send_event(&event_tx, &context, event).await;
+                        }
+                        send_event(
+                            &event_tx,
+                            &context,
+                            BackendEvent::BundleIconsFinished(target),
+                        )
+                        .await;
+                    });
+                } else {
+                    send_event(
+                        &event_tx,
+                        &context,
+                        BackendEvent::BundlePackagesFailed(
+                            target,
+                            BridgeError::device_unavailable(),
+                        ),
+                    )
+                    .await;
+                }
+            }
+            BackendCommand::LoadBundleIcon { target, package } => {
+                if ensure_target(&registry, &target) {
+                    let transport = Arc::clone(&transport);
+                    let event_tx = event_tx.clone();
+                    let context = context.clone();
+                    tokio::spawn(async move {
+                        let event = match fetch_bundle_icon(&transport, &target, &package, true)
+                            .await
+                        {
+                            IconOutcome::Icon(bytes) => BackendEvent::BundleIconLoaded(
+                                target.clone(),
+                                package.bundle.clone(),
+                                Some(bytes),
+                            ),
+                            _ => {
+                                BackendEvent::BundleIconLoaded(target, package.bundle.clone(), None)
+                            }
+                        };
+                        send_event(&event_tx, &context, event).await;
+                    });
+                }
+            }
             BackendCommand::LoadBundleDetails(target, bundle) => {
                 if ensure_target(&registry, &target) {
                     let transport = Arc::clone(&transport);
@@ -520,7 +617,11 @@ async fn run_backend(
                     .await;
                 }
             }
-            BackendCommand::OpenShell { target, session } => {
+            BackendCommand::OpenShell {
+                target,
+                session,
+                size,
+            } => {
                 if !ensure_target(&registry, &target) {
                     send_event(
                         &event_tx,
@@ -533,7 +634,7 @@ async fn run_backend(
                     .await;
                     continue;
                 }
-                match transport.start_shell(&target.key).await {
+                match transport.start_shell(&target.key, size).await {
                     Ok(handle) => {
                         let input = handle.input();
                         shell_inputs.write().unwrap().insert(session, input);
@@ -1021,7 +1122,11 @@ fn spawn_forwarder(
     tokio::spawn(async move {
         let mut handle = handle;
         let mut exit_code = None;
-        loop {
+        // 通道关闭后必须直接跳出整个循环:外层再 poll 一次 next_chunk
+        // 会拿到 None 并第二次 wait(),对已完成的 JoinHandle 再 poll
+        // 会 panic("JoinHandle polled after completion"),ShellClosed
+        // 事件就永远发不出去。
+        'session: loop {
             let chunk = tokio::time::timeout(POLL_INTERVAL, handle.next_chunk()).await;
             let chunk = match chunk {
                 // 轮询窗口到期:借机检查取消。
@@ -1050,7 +1155,7 @@ fn spawn_forwarder(
                     }
                     Ok(None) => {
                         exit_code = handle.wait().await.ok().flatten();
-                        break;
+                        break 'session;
                     }
                     Err(_) => break,
                 }
@@ -1071,6 +1176,105 @@ fn spawn_forwarder(
         };
         send_event(&event_tx, &context, event).await;
     });
+}
+
+/// 批量加载时单个 HAP 的大小上限:更大的包只在用户选中时按需拉取。
+const BULK_ICON_HAP_LIMIT: u64 = 32 * 1024 * 1024;
+
+/// 图标缓存路径:`%LOCALAPPDATA%hdc\icons\<bundle>-<stamp hash>.png`;
+/// 没有图标时写同名 `.none` 标记,避免每次启动重复拉包。
+fn icon_cache_path(bundle: &BundleName, stamp: &str) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = base.join("fhdc").join("icons");
+    std::fs::create_dir_all(&directory).ok()?;
+    let digest = Sha256::digest(stamp.as_bytes());
+    let suffix: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(directory.join(format!("{}-{suffix}.png", bundle.as_str())))
+}
+
+/// 取一个包的图标:缓存命中直接返回;否则逐个 HAP 拉回本地解包。
+/// 批量模式跳过超大 HAP(不写负缓存,选中时还能按需重试)。
+enum IconOutcome {
+    Icon(Vec<u8>),
+    Missing,
+    Skipped,
+}
+
+async fn fetch_bundle_icon(
+    transport: &Arc<dyn HdcTransport>,
+    target: &DeviceTarget,
+    package: &BundlePackage,
+    allow_large: bool,
+) -> IconOutcome {
+    let Some(cache) = icon_cache_path(&package.bundle, &package.stamp()) else {
+        return IconOutcome::Missing;
+    };
+    if let Ok(bytes) = std::fs::read(&cache) {
+        return IconOutcome::Icon(bytes);
+    }
+    if cache.with_extension("none").exists() {
+        return IconOutcome::Missing;
+    }
+    if !allow_large
+        && package
+            .haps
+            .iter()
+            .all(|hap| hap.size_bytes > BULK_ICON_HAP_LIMIT)
+    {
+        return IconOutcome::Skipped;
+    }
+
+    let mut pulled_any = false;
+    let mut icon = None;
+    for hap in &package.haps {
+        if !allow_large && hap.size_bytes > BULK_ICON_HAP_LIMIT {
+            continue;
+        }
+        let Ok(remote) = RemotePath::new(hap.path.as_str()) else {
+            continue;
+        };
+        let local =
+            std::env::temp_dir().join(format!("fhdc_icon_{}.hap", uuid::Uuid::new_v4().simple()));
+        let token = CancellationToken::new();
+        let pulled = transport
+            .pull_file(
+                &target.key,
+                &remote,
+                &local,
+                OverwritePolicy::ReplaceConfirmed,
+                &token,
+            )
+            .await;
+        if pulled.is_err() {
+            let _ = tokio::fs::remove_file(&local).await;
+            continue;
+        }
+        pulled_any = true;
+        icon = fhdc_hdc::extract_hap_icon(&local);
+        let _ = tokio::fs::remove_file(&local).await;
+        if icon.is_some() {
+            break;
+        }
+    }
+
+    match (&icon, pulled_any) {
+        (Some(bytes), _) => {
+            let _ = tokio::fs::write(&cache, bytes).await;
+            IconOutcome::Icon(bytes.clone())
+        }
+        (None, true) => {
+            let _ = tokio::fs::write(cache.with_extension("none"), b"").await;
+            IconOutcome::Missing
+        }
+        (None, false) => IconOutcome::Missing,
+    }
 }
 
 fn ensure_target(registry: &DeviceRegistry, target: &DeviceTarget) -> bool {

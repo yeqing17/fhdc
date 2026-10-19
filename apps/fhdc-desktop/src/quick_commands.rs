@@ -52,31 +52,51 @@ impl QuickCommand {
     }
 }
 
+/// 预设版本:升级后首次启动把新增预设合并进用户列表(只追加缺的)。
+const PRESETS_REVISION: u32 = 1;
+const PRESETS_REVISION_KEY: &str = "fhdc.quick_presets_rev";
+
 #[derive(Debug, Default)]
 pub struct QuickCommandStore {
     pub commands: Vec<QuickCommand>,
     pub manage_open: bool,
     pub status: Option<String>,
+    presets_revision: u32,
+}
+
+/// 内置预设:覆盖日常排查最常用的几类。发送前可在「管理」里改包名。
+pub fn presets() -> Vec<QuickCommand> {
+    const PRESETS: [(&str, &str); 14] = [
+        ("设备型号", "param get const.product.model"),
+        ("系统版本", "param get const.product.software.version"),
+        ("内存占用", "free -m"),
+        ("CPU 占用", "top -n 1 -b | head -20"),
+        ("磁盘", "df -k /data"),
+        ("进程列表", "ps -ef | head -30"),
+        ("最近任务", "aa dump -l | head -40"),
+        ("按 PID 抓 log(改包名)", "hilog -P $(pidof com.example.app)"),
+        ("最近 100 条 log", "hilog -x | tail -100"),
+        ("清空 log 缓冲", "hilog -r"),
+        ("内核日志", "dmesg | tail -50"),
+        ("网络接口", "ifconfig"),
+        ("应用信息(改包名)", "bm dump -n com.example.app"),
+        (
+            "截屏到设备",
+            "snapshot_display -f /data/local/tmp/shot.jpeg && echo 已保存 /data/local/tmp/shot.jpeg",
+        ),
+    ];
+    PRESETS
+        .into_iter()
+        .map(|(label, command)| QuickCommand {
+            label: label.to_owned(),
+            command: command.to_owned(),
+            run: true,
+        })
+        .collect()
 }
 
 fn defaults() -> Vec<QuickCommand> {
-    vec![
-        QuickCommand {
-            label: "设备型号".to_owned(),
-            command: "param get const.product.model".to_owned(),
-            run: true,
-        },
-        QuickCommand {
-            label: "系统版本".to_owned(),
-            command: "param get const.product.software.version".to_owned(),
-            run: true,
-        },
-        QuickCommand {
-            label: "内存".to_owned(),
-            command: "cat /proc/meminfo".to_owned(),
-            run: true,
-        },
-    ]
+    presets()
 }
 
 impl QuickCommandStore {
@@ -85,10 +105,21 @@ impl QuickCommandStore {
             .and_then(|storage| storage.get_string("fhdc.shell_quick_commands"))
             .and_then(|value| serde_json::from_str::<Vec<QuickCommand>>(&value).ok())
             .unwrap_or_else(defaults);
-        Self {
+        let revision = storage
+            .and_then(|storage| storage.get_string(PRESETS_REVISION_KEY))
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mut store = Self {
             commands,
             ..Self::default()
+        };
+        if revision < PRESETS_REVISION {
+            store.append_missing_presets();
+            store.presets_revision = PRESETS_REVISION;
+        } else {
+            store.presets_revision = revision;
         }
+        store
     }
 
     pub fn save(&self, storage: &mut dyn eframe::Storage) {
@@ -100,6 +131,24 @@ impl QuickCommandStore {
         if let Ok(value) = serde_json::to_string(&sendable) {
             storage.set_string("fhdc.shell_quick_commands", value);
         }
+        storage.set_string(PRESETS_REVISION_KEY, self.presets_revision.to_string());
+    }
+
+    /// 把尚不存在的预设追加到列表末尾,返回新增条数。
+    pub fn append_missing_presets(&mut self) -> usize {
+        let existing: Vec<String> = self
+            .commands
+            .iter()
+            .map(|command| command.command.clone())
+            .collect();
+        let mut added = 0;
+        for preset in presets() {
+            if !existing.iter().any(|command| command == &preset.command) {
+                self.commands.push(preset);
+                added += 1;
+            }
+        }
+        added
     }
 
     /// 工具栏内联条:点击即发送。
@@ -197,6 +246,18 @@ impl QuickCommandStore {
                             run: true,
                         });
                     }
+                    if ui
+                        .button("补全预设")
+                        .on_hover_text("把缺失的内置常用指令追加到列表")
+                        .clicked()
+                    {
+                        let added = self.append_missing_presets();
+                        self.status = Some(if added == 0 {
+                            "预设已齐全".to_owned()
+                        } else {
+                            format!("已补充 {added} 条预设")
+                        });
+                    }
                     if ui.button("导入 JSON…").clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("JSON", &["json"])
@@ -282,4 +343,66 @@ fn export_json(store: &QuickCommandStore, path: &std::path::Path) -> Result<(), 
     };
     let text = serde_json::to_string_pretty(&file).map_err(|error| error.to_string())?;
     std::fs::write(path, text).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::Storage as _;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct MemoryStorage {
+        values: HashMap<String, String>,
+    }
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.values.insert(key.to_owned(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn fresh_storage_gets_all_presets() {
+        let storage = MemoryStorage::default();
+        let store = QuickCommandStore::load(Some(&storage));
+        assert_eq!(store.commands.len(), presets().len());
+        assert!(
+            store
+                .commands
+                .iter()
+                .any(|command| command.command.contains("hilog -P $(pidof"))
+        );
+    }
+
+    #[test]
+    fn existing_list_is_merged_once() {
+        let mut storage = MemoryStorage::default();
+        let old = vec![QuickCommand {
+            label: "自定义".to_owned(),
+            command: "echo hello".to_owned(),
+            run: true,
+        }];
+        storage.set_string(
+            "fhdc.shell_quick_commands",
+            serde_json::to_string(&old).expect("json"),
+        );
+        let mut store = QuickCommandStore::load(Some(&storage));
+        // 旧条目保留,预设补齐,且不重复追加。
+        assert_eq!(store.commands.len(), presets().len() + 1);
+        assert_eq!(store.commands[0].command, "echo hello");
+        let added = store.append_missing_presets();
+        assert_eq!(added, 0);
+        // 保存后带上版本号,下次加载不再合并。
+        let mut storage2 = MemoryStorage::default();
+        store.save(&mut storage2);
+        let reloaded = QuickCommandStore::load(Some(&storage2));
+        assert_eq!(reloaded.commands.len(), store.commands.len());
+    }
 }

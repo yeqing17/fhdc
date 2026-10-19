@@ -61,11 +61,14 @@ pub(crate) async fn list_directory(
 }
 
 async fn remote_exists(core: &ProcessHdcTransport, key: &ConnectKey, path: &RemotePath) -> bool {
-    let script = r#"[ -e "$1" ] || [ -L "$1" ]"#;
-    let command = script_arguments(script, &["fhdc-files", path.as_str()]);
-    core.shell_optional(key, &command)
+    // hdc 不透传设备端退出码(实测 3.2.0d 恒为 0),存在性探测必须用文本
+    // 标记;退出码判存在会让"不覆盖"模式的上传永远被误判为已存在。
+    const SCRIPT: &str = r#"if [ -e "$1" ] || [ -L "$1" ]; then echo FHDC_EXISTS_MARK; fi"#;
+    let command = script_arguments(SCRIPT, &["fhdc-files", path.as_str()]);
+    core.shell_text(key, &command)
         .await
-        .is_some_and(|code| code == 0)
+        .map(|output| output.contains("FHDC_EXISTS_MARK"))
+        .unwrap_or(false)
 }
 
 pub(crate) async fn push_file(
@@ -187,12 +190,36 @@ async fn run_mutation_script(
     let to = second.map(|p| p.as_str()).unwrap_or("");
     let command = script_arguments(script, &["fhdc-files", path.as_str(), to]);
     let output = core.shell_exit_code(key, &command).await?;
-    match output.exit_code {
-        Some(0) => Ok(()),
-        Some(17) => Err(BridgeError::new(ErrorCode::AlreadyExists, "目标已存在")),
-        Some(22) | Some(2) => Err(BridgeError::new(ErrorCode::PathNotFound, "路径不存在")),
-        _ => Err(map_command_error(&output.stderr, &output.stdout)),
+    classify_mutation_output(&output.stdout, &output.stderr, output.exit_code)
+}
+
+/// 设备端 mutation(mkdir/mv/rm)的结果判定。实测 hdc 不透传设备端退出
+/// 码(失败也退出 0),所以以设备端输出为唯一事实:成功时输出为空,
+/// 失败时是 busybox 风格的 `mkdir: '...': File exists` 等文本。
+fn classify_mutation_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    exit_code: Option<i32>,
+) -> Result<(), BridgeError> {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stdout = String::from_utf8_lossy(stdout);
+    let lowered = format!("{stderr}{stdout}").to_lowercase();
+    if lowered.contains("file exists") {
+        return Err(BridgeError::new(ErrorCode::AlreadyExists, "目标已存在"));
     }
+    if lowered.contains("permission denied") || lowered.contains("read-only") {
+        return Err(BridgeError::new(
+            ErrorCode::PermissionDenied,
+            format!("权限不足: {}", stderr.trim()),
+        ));
+    }
+    if lowered.contains("no such file") || lowered.contains("not found") {
+        return Err(BridgeError::new(ErrorCode::PathNotFound, "路径不存在"));
+    }
+    if !lowered.trim().is_empty() || exit_code.is_some_and(|code| code != 0) {
+        return Err(map_command_error(stderr.as_bytes(), stdout.as_bytes()));
+    }
+    Ok(())
 }
 
 fn interpret_transfer(

@@ -139,6 +139,8 @@ pub struct FhdcApp {
     windows: WindowFlags,
     toast: Option<Toast>,
     last_error: Option<BridgeError>,
+    /// 首帧检查持久化的窗口尺寸/位置,degenerate 时纠正一次。
+    viewport_checked: bool,
     hdc_ready: Option<(String, String)>,
     hdc_unavailable: Option<String>,
     hdc_override: String,
@@ -200,6 +202,7 @@ impl FhdcApp {
             windows: WindowFlags::default(),
             toast: None,
             last_error: None,
+            viewport_checked: false,
             hdc_ready: None,
             hdc_unavailable: None,
             hdc_override,
@@ -1029,8 +1032,28 @@ impl FhdcApp {
     }
 }
 
+impl FhdcApp {
+    /// 持久化的窗口状态可能来自最小化/异常退出的那一刻(0×0 或
+    /// -32000 坐标),恢复后窗口会缩成一条或跑到屏幕外。首帧检测到
+    /// 这种尺寸就重置成默认大小并摆回可见区域。
+    fn sanitize_viewport_once(&mut self, context: &Context) {
+        if self.viewport_checked {
+            return;
+        }
+        let Some(rect) = context.input(|input| input.viewport().inner_rect) else {
+            return;
+        };
+        self.viewport_checked = true;
+        if rect.width() < 600.0 || rect.height() < 400.0 {
+            context.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1180.0, 760.0)));
+            context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(80.0, 80.0)));
+        }
+    }
+}
+
 impl eframe::App for FhdcApp {
     fn update(&mut self, context: &Context, _frame: &mut eframe::Frame) {
+        self.sanitize_viewport_once(context);
         self.process_events(context);
         if self.dark != context.style().visuals.dark_mode {
             self.apply_theme(context);

@@ -1,5 +1,7 @@
 //! 应用管理:包列表、详情、启动/停止/清除数据/卸载、HAP 安装。
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -11,6 +13,7 @@ use fhdc_domain::BackendCommand;
 use fhdc_domain::BackendEvent;
 use fhdc_domain::BundleDetails;
 use fhdc_domain::BundleName;
+use fhdc_domain::BundlePackage;
 use fhdc_domain::BundleRecord;
 use fhdc_domain::DeviceTarget;
 
@@ -33,6 +36,18 @@ pub struct AppsState {
     installing: Option<String>,
     install_note: Option<String>,
     last_load_attempt: Option<Instant>,
+    /// 图标加载:包安装信息(本地化名称 + HAP 路径)。
+    packages: HashMap<BundleName, BundlePackage>,
+    /// 已解码的图标;None 表示该包确认没有图标(不再重试)。
+    icons: HashMap<BundleName, Option<egui::TextureHandle>>,
+    /// 运行时事件先入队,渲染线程统一建纹理。
+    pending_icons: Vec<(BundleName, Option<Vec<u8>>)>,
+    icons_requested: bool,
+    icons_loading: bool,
+    icons_done: usize,
+    icons_total: usize,
+    /// 已发起按需加载的包,避免反复请求。
+    icon_requests: HashSet<BundleName>,
     /// 供 app.rs 投递的拖拽安装队列。
     pub pending_install: Option<PathBuf>,
 }
@@ -52,6 +67,14 @@ impl AppsState {
         self.last_load_attempt = None;
         // 就地复位加载态,旧 target 的结果事件不再匹配。
         self.loading = false;
+        self.packages.clear();
+        self.icons.clear();
+        self.pending_icons.clear();
+        self.icons_requested = false;
+        self.icons_loading = false;
+        self.icons_done = 0;
+        self.icons_total = 0;
+        self.icon_requests.clear();
     }
 
     /// 供上层在命令发送失败时回收乐观置位的加载状态。
@@ -60,18 +83,31 @@ impl AppsState {
     }
 
     pub fn maybe_auto_load(&mut self, ctx: &PanelCtx) -> Option<BackendCommand> {
-        if !ctx.online() || self.loading || !self.bundles.is_empty() {
+        if !ctx.online() {
             return None;
         }
-        let now = Instant::now();
-        if let Some(last) = self.last_load_attempt
-            && now.duration_since(last).as_secs() < 5
-        {
-            return None;
+        if self.bundles.is_empty() {
+            if self.loading {
+                return None;
+            }
+            let now = Instant::now();
+            if let Some(last) = self.last_load_attempt
+                && now.duration_since(last).as_secs() < 5
+            {
+                return None;
+            }
+            self.last_load_attempt = Some(now);
+            self.loading = true;
+            return ctx.target.clone().map(BackendCommand::LoadBundles);
         }
-        self.last_load_attempt = Some(now);
-        self.loading = true;
-        ctx.target.clone().map(BackendCommand::LoadBundles)
+        // 包列表就绪后自动开始图标加载(磁盘缓存命中时几乎瞬间完成)。
+        if !self.icons_requested {
+            self.icons_requested = true;
+            self.icons_loading = true;
+            self.icons_done = 0;
+            return ctx.target.clone().map(BackendCommand::LoadBundleIcons);
+        }
+        None
     }
 
     pub fn handle_event(&mut self, event: &BackendEvent) {
@@ -98,6 +134,42 @@ impl AppsState {
                 if self.target.as_ref() == Some(target) {
                     self.loading = false;
                     self.error = Some(error.detail.clone());
+                }
+            }
+            BackendEvent::BundlePackagesLoaded(target, packages) => {
+                if self.target.as_ref() == Some(target) {
+                    self.packages = packages
+                        .iter()
+                        .cloned()
+                        .map(|package| (package.bundle.clone(), package))
+                        .collect();
+                    self.icons_total = packages.len();
+                    self.icons_done = 0;
+                    self.icons_loading = true;
+                }
+            }
+            BackendEvent::BundlePackagesFailed(target, _) => {
+                if self.target.as_ref() == Some(target) {
+                    self.icons_loading = false;
+                }
+            }
+            BackendEvent::BundleIconLoaded(target, bundle, bytes) => {
+                if self.target.as_ref() == Some(target) {
+                    self.icons_done += 1;
+                    self.pending_icons.push((bundle.clone(), bytes.clone()));
+                    self.icon_requests.remove(bundle);
+                }
+            }
+            BackendEvent::BundleIconSkipped(target, bundle) => {
+                if self.target.as_ref() == Some(target) {
+                    self.icons_done += 1;
+                    // 不写入 icons:选中该包时会按需再拉一次。
+                    self.icon_requests.remove(bundle);
+                }
+            }
+            BackendEvent::BundleIconsFinished(target) => {
+                if self.target.as_ref() == Some(target) {
+                    self.icons_loading = false;
                 }
             }
             BackendEvent::BundleDetailsLoading(target, bundle) => {
@@ -171,6 +243,11 @@ impl AppsState {
 
     pub fn show(&mut self, ui: &mut Ui, ctx: &PanelCtx) -> Commands {
         let mut commands = Vec::new();
+        // 后台事件只带字节;纹理必须在渲染线程创建,这里统一转。
+        for (bundle, bytes) in std::mem::take(&mut self.pending_icons) {
+            let texture = bytes.and_then(|bytes| decode_icon(ui.ctx(), &bundle, &bytes));
+            self.icons.insert(bundle, texture);
+        }
         ui.heading("应用");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -181,6 +258,11 @@ impl AppsState {
                 && let Some(target) = ctx.target.clone()
             {
                 self.loading = true;
+                self.icons_requested = false;
+                self.icons.clear();
+                self.pending_icons.clear();
+                self.icon_requests.clear();
+                self.packages.clear();
                 commands.push(BackendCommand::LoadBundles(target));
             }
             if ui.button("安装 HAP…").clicked()
@@ -192,6 +274,13 @@ impl AppsState {
             }
             if self.loading {
                 ui.spinner();
+            } else if self.icons_loading {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(format!("图标 {}/{}", self.icons_done, self.icons_total))
+                        .small()
+                        .weak(),
+                );
             }
             ui.separator();
             ui.add(
@@ -236,29 +325,55 @@ impl AppsState {
                         let query = self.query.to_lowercase();
                         let mut clicked: Option<BundleName> = None;
                         for bundle in &self.bundles {
+                            let display_name = self
+                                .packages
+                                .get(&bundle.name)
+                                .and_then(|package| package.label.clone());
+                            // 本地化名称与包名都参与搜索。
                             if !query.is_empty()
                                 && !bundle.name.as_str().to_lowercase().contains(&query)
+                                && !display_name
+                                    .as_deref()
+                                    .is_some_and(|label| label.to_lowercase().contains(&query))
                             {
                                 continue;
                             }
                             let is_selected = self.selected.as_ref() == Some(&bundle.name);
-                            let label = if bundle.system {
-                                format!("⚙ {}", bundle.name.as_str())
-                            } else {
-                                bundle.name.as_str().to_owned()
-                            };
-                            if ui
-                                .add(egui::Button::selectable(is_selected, label))
-                                .clicked()
-                            {
-                                clicked = Some(bundle.name.clone());
-                            }
+                            // 列表只放图标 + 应用名称;包名在右侧详情里看。
+                            ui.horizontal(|ui| {
+                                draw_app_icon(
+                                    ui,
+                                    self.icons.get(&bundle.name).and_then(Option::as_ref),
+                                    display_name.as_deref().unwrap_or(bundle.name.as_str()),
+                                    20.0,
+                                );
+                                let title = display_name.as_deref().unwrap_or(bundle.name.as_str());
+                                if ui
+                                    .add(egui::Button::selectable(is_selected, title))
+                                    .clicked()
+                                {
+                                    clicked = Some(bundle.name.clone());
+                                }
+                            });
                         }
                         if let Some(name) = clicked {
                             self.selected = Some(name.clone());
                             self.details = None;
                             if let Some(target) = ctx.target.clone() {
-                                commands.push(BackendCommand::LoadBundleDetails(target, name));
+                                commands.push(BackendCommand::LoadBundleDetails(
+                                    target.clone(),
+                                    name.clone(),
+                                ));
+                                // 批量阶段跳过大包时,选中即按需拉一次。
+                                if !self.icons_loading
+                                    && !self.icons.contains_key(&name)
+                                    && !self.icon_requests.contains(&name)
+                                    && let Some(package) = self.packages.get(&name).cloned()
+                                {
+                                    self.icon_requests.insert(name.clone());
+                                    commands
+                                        .push(BackendCommand::LoadBundleIcon { target, package });
+                                }
                             }
                         }
                         if self.bundles.is_empty() && !self.loading {
@@ -272,7 +387,26 @@ impl AppsState {
                     ui.label(egui::RichText::new("选择左侧的应用查看详情。").weak());
                     return;
                 };
-                ui.label(egui::RichText::new(selected.as_str()).strong());
+                let display_name = self
+                    .packages
+                    .get(&selected)
+                    .and_then(|package| package.label.clone());
+                ui.horizontal(|ui| {
+                    draw_app_icon(
+                        ui,
+                        self.icons.get(&selected).and_then(Option::as_ref),
+                        display_name.as_deref().unwrap_or(selected.as_str()),
+                        40.0,
+                    );
+                    ui.vertical(|ui| {
+                        if let Some(label) = &display_name {
+                            ui.label(egui::RichText::new(label).strong());
+                            ui.label(egui::RichText::new(selected.as_str()).small().weak());
+                        } else {
+                            ui.label(egui::RichText::new(selected.as_str()).strong());
+                        }
+                    });
+                });
                 ui.add_space(4.0);
                 if self.details_loading {
                     ui.spinner();
@@ -417,4 +551,59 @@ impl AppsState {
         }
         commands
     }
+}
+
+/// 列表/详情里的应用图标;没有图标时画一个首字母圆形占位,保持行对齐。
+fn draw_app_icon(
+    ui: &mut Ui,
+    texture: Option<&egui::TextureHandle>,
+    fallback_text: &str,
+    size: f32,
+) {
+    if let Some(texture) = texture {
+        ui.add(
+            egui::Image::new(texture)
+                .fit_to_exact_size(egui::vec2(size, size))
+                .corner_radius(3.0),
+        );
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let visuals = ui.visuals();
+    ui.painter()
+        .circle_filled(rect.center(), size * 0.48, visuals.widgets.inactive.bg_fill);
+    let initial = fallback_text
+        .chars()
+        .next()
+        .map(|character| character.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::proportional(size * 0.52),
+        visuals.weak_text_color(),
+    );
+}
+
+/// 把图标字节解码成纹理;超过 128px 的缩到 96px,省显存也够清晰。
+fn decode_icon(
+    context: &egui::Context,
+    bundle: &BundleName,
+    bytes: &[u8],
+) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let image = if image.width() > 128 || image.height() > 128 {
+        image.thumbnail(96, 96)
+    } else {
+        image
+    };
+    let rgba = image.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    Some(context.load_texture(
+        format!("app-icon-{}", bundle.as_str()),
+        color,
+        egui::TextureOptions::LINEAR,
+    ))
 }
