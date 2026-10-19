@@ -22,10 +22,42 @@ use crate::runtime::app_action_label;
 use super::Commands;
 use super::PanelCtx;
 
+/// 应用分类:三方应用、系统应用或全部。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppFilter {
+    /// 默认聚焦三方应用——系统应用动辄上百个,少说无益。
+    #[default]
+    ThirdParty,
+    System,
+    All,
+}
+
+impl AppFilter {
+    const ALL: [AppFilter; 3] = [AppFilter::ThirdParty, AppFilter::System, AppFilter::All];
+
+    fn label(self) -> &'static str {
+        match self {
+            AppFilter::ThirdParty => "第三方应用",
+            AppFilter::System => "系统应用",
+            AppFilter::All => "全部",
+        }
+    }
+
+    fn accepts(self, bundle: &BundleRecord) -> bool {
+        match self {
+            AppFilter::ThirdParty => !bundle.system,
+            AppFilter::System => bundle.system,
+            AppFilter::All => true,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct AppsState {
     target: Option<DeviceTarget>,
     bundles: Vec<BundleRecord>,
+    /// 列表分类;默认第三方应用。
+    filter: AppFilter,
     loading: bool,
     error: Option<String>,
     query: String,
@@ -275,12 +307,14 @@ impl AppsState {
             if self.loading {
                 ui.spinner();
             } else if self.icons_loading {
+                // 图标在后台静默补齐,只在悬停时提示进度,不打扰。
                 ui.spinner();
                 ui.label(
                     egui::RichText::new(format!("图标 {}/{}", self.icons_done, self.icons_total))
                         .small()
                         .weak(),
-                );
+                )
+                .on_hover_text("正在后台加载应用图标");
             }
             ui.separator();
             ui.add(
@@ -288,6 +322,23 @@ impl AppsState {
                     .hint_text("搜索包名…")
                     .desired_width(180.0),
             );
+        });
+        // 分类:默认三方应用,系统应用与全部按需切换。
+        ui.horizontal(|ui| {
+            for filter in AppFilter::ALL {
+                let count = self
+                    .bundles
+                    .iter()
+                    .filter(|bundle| filter.accepts(bundle))
+                    .count();
+                let label = format!("{} {}", filter.label(), count);
+                if ui
+                    .add(egui::Button::selectable(self.filter == filter, label))
+                    .clicked()
+                {
+                    self.filter = filter;
+                }
+            }
         });
         if let Some(note) = &self.install_note {
             ui.label(
@@ -325,6 +376,10 @@ impl AppsState {
                         let query = self.query.to_lowercase();
                         let mut clicked: Option<BundleName> = None;
                         for bundle in &self.bundles {
+                            // 分类过滤:默认只列三方应用。
+                            if !self.filter.accepts(bundle) {
+                                continue;
+                            }
                             let display_name = self
                                 .packages
                                 .get(&bundle.name)
@@ -378,6 +433,17 @@ impl AppsState {
                         }
                         if self.bundles.is_empty() && !self.loading {
                             ui.label(egui::RichText::new("(无应用,点击刷新)").weak());
+                        } else if self.filter != AppFilter::All
+                            && !self
+                                .bundles
+                                .iter()
+                                .any(|bundle| self.filter.accepts(bundle))
+                        {
+                            // 该分类下确实没有应用,和"还没加载出来"要区分开。
+                            ui.label(
+                                egui::RichText::new(format!("(没有{})", self.filter.label()))
+                                    .weak(),
+                            );
                         }
                     });
             });
@@ -606,4 +672,37 @@ fn decode_icon(
         color,
         egui::TextureOptions::LINEAR,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppFilter, AppsState};
+    use fhdc_domain::BundleName;
+    use fhdc_domain::BundleRecord;
+
+    fn record(name: &str, system: bool) -> BundleRecord {
+        BundleRecord {
+            name: BundleName::new(name).expect("valid bundle name"),
+            system,
+        }
+    }
+
+    #[test]
+    fn default_filter_is_third_party() {
+        assert_eq!(AppFilter::default(), AppFilter::ThirdParty);
+        let state = AppsState::default();
+        assert_eq!(state.filter, AppFilter::ThirdParty);
+    }
+
+    #[test]
+    fn filter_selects_expected_subsets() {
+        let third = record("com.example.demo", false);
+        let system = record("com.ohos.launcher", true);
+        assert!(AppFilter::ThirdParty.accepts(&third));
+        assert!(!AppFilter::ThirdParty.accepts(&system));
+        assert!(AppFilter::System.accepts(&system));
+        assert!(!AppFilter::System.accepts(&third));
+        assert!(AppFilter::All.accepts(&third));
+        assert!(AppFilter::All.accepts(&system));
+    }
 }

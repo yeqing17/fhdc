@@ -36,6 +36,29 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// 枚举全部包(每包一次 bm dump -l)是慢命令,单独给更长的超时。
 const PACKAGES_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 设备端包清单脚本:输出 `bundle\034system\036` 记录流。
+/// 系统/三方的判据是安装根目录——系统应用装在 `/system/app`,三方应用
+/// 装在 `/data/app/el1/bundle/public`;这比解析 `bm dump` 的 JSON 稳,
+/// 各系统版本的字段名与嵌套结构差异较大。
+const BUNDLE_LIST_SCRIPT: &str = r#"for b in $(bm dump -a 2>/dev/null | sed -n 's/^[[:space:]]*//p' | grep -v '^ID:' | grep -v '^$'); do
+  case "$b" in
+    *.*) ;;
+    *) continue ;;
+  esac
+  sys=0
+  if [ -d "/system/app/$b" ]; then
+    sys=1
+  elif [ -d "/data/app/el1/bundle/public/$b" ]; then
+    sys=0
+  else
+    # 两个常见根都没命中时,退回包名启发式:com.ohos.* 多为系统应用。
+    case "$b" in
+      com.ohos.*|com.huawei.*|com.hihonor.*) sys=1 ;;
+    esac
+  fi
+  printf '%s\034%s\036' "$b" "$sys"
+done"#;
+
 /// 设备端枚举脚本:输出 `bundle\034label\034size\034mtime\034hap\036` 记录流。
 const BUNDLE_PACKAGES_SCRIPT: &str = r#"for b in $(bm dump -a 2>/dev/null | sed -n 's/^[[:space:]]*//p' | grep -v '^ID:' | grep -v '^$'); do
   label=''
@@ -452,7 +475,8 @@ impl HdcTransport for ProcessHdcTransport {
     }
 
     async fn list_bundles(&self, key: &ConnectKey) -> Result<Vec<BundleRecord>, BridgeError> {
-        let output = self.shell_text(key, "bm dump -a").await?;
+        // 一次 shell 调用同时拿到包名与系统/三方标记。
+        let output = self.shell_text(key, BUNDLE_LIST_SCRIPT).await?;
         Ok(parse_bundles(&output))
     }
 
@@ -845,8 +869,33 @@ pub(crate) fn parse_bundle_packages(output: &str) -> Vec<BundlePackage> {
     packages
 }
 
-/// 解析 `bm dump -a` 的包名列表(容忍标题行)。
+/// 解析包清单。
+///
+/// 首选设备端脚本的 `bundle\034system\036` 记录流(带系统/三方标记);
+/// 若拿到的是 `bm dump -a` 的原始逐行输出,则退回旧路径:只列包名,
+/// 一律按三方应用处理。
 pub(crate) fn parse_bundles(output: &str) -> Vec<BundleRecord> {
+    if output.contains('\u{1e}') {
+        let mut records = Vec::new();
+        for record in output.split('\u{1e}') {
+            if record.is_empty() {
+                continue;
+            }
+            let mut fields = record.split('\u{1c}');
+            let Some(name) = fields.next().map(str::trim) else {
+                continue;
+            };
+            let Ok(name) = BundleName::new(name) else {
+                continue;
+            };
+            let system = fields.next().map(str::trim) == Some("1");
+            records.push(BundleRecord { name, system });
+        }
+        records.sort_by(|a, b| a.name.cmp(&b.name));
+        records.dedup_by(|a, b| a.name == b.name);
+        return records;
+    }
+
     let mut names: Vec<BundleName> = output
         .lines()
         .map(str::trim)
@@ -999,6 +1048,26 @@ mod tests {
         let bundles = parse_bundles(output);
         let names: Vec<&str> = bundles.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["com.example.demo_app", "com.ohos.launcher"]);
+        // 旧路径拿不到系统标记,一律按三方应用处理。
+        assert!(bundles.iter().all(|bundle| !bundle.system));
+    }
+
+    #[test]
+    fn bundles_parse_system_flag_from_record_stream() {
+        // 设备端脚本输出:包名 + 系统标记。
+        let output = "com.ohos.launcher\u{1c}1\u{1e}com.example.demo\u{1c}0\u{1e}com.ohos.settings\u{1c}1\u{1e}";
+        let bundles = parse_bundles(output);
+        let names: Vec<&str> = bundles.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["com.example.demo", "com.ohos.launcher", "com.ohos.settings"]
+        );
+        let system: Vec<&str> = bundles
+            .iter()
+            .filter(|b| b.system)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(system, vec!["com.ohos.launcher", "com.ohos.settings"]);
     }
 
     #[test]

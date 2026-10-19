@@ -463,8 +463,13 @@ async fn run_backend(
                         });
                         for index in order {
                             let package = &packages[index];
-                            let event = match fetch_bundle_icon(&transport, &target, package, false)
-                                .await
+                            let event = match fetch_bundle_icon(
+                                &transport,
+                                &target,
+                                package,
+                                IconFetchMode::Bulk,
+                            )
+                            .await
                             {
                                 IconOutcome::Icon(bytes) => BackendEvent::BundleIconLoaded(
                                     target.clone(),
@@ -508,8 +513,13 @@ async fn run_backend(
                     let event_tx = event_tx.clone();
                     let context = context.clone();
                     tokio::spawn(async move {
-                        let event = match fetch_bundle_icon(&transport, &target, &package, true)
-                            .await
+                        let event = match fetch_bundle_icon(
+                            &transport,
+                            &target,
+                            &package,
+                            IconFetchMode::OnDemand,
+                        )
+                        .await
                         {
                             IconOutcome::Icon(bytes) => BackendEvent::BundleIconLoaded(
                                 target.clone(),
@@ -1178,8 +1188,19 @@ fn spawn_forwarder(
     });
 }
 
-/// 批量加载时单个 HAP 的大小上限:更大的包只在用户选中时按需拉取。
-const BULK_ICON_HAP_LIMIT: u64 = 32 * 1024 * 1024;
+/// 批量加载时单个 HAP 的硬上限:超过它的包连图标也不取。
+/// 拉整个 HAP 只是为了取 resources 里的图标,几百 MB 的包不值得为
+/// 一张小图付这个代价——这类包留给用户选中时按需拉取。
+const BULK_ICON_HAP_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// 图标获取方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IconFetchMode {
+    /// 批量:静默预热所有应用图标,只跳过极端超大的包。
+    Bulk,
+    /// 按需:用户明确要看这个应用的图标,任何大小都照拉。
+    OnDemand,
+}
 
 /// 图标缓存路径:`%LOCALAPPDATA%hdc\icons\<bundle>-<stamp hash>.png`;
 /// 没有图标时写同名 `.none` 标记,避免每次启动重复拉包。
@@ -1211,7 +1232,7 @@ async fn fetch_bundle_icon(
     transport: &Arc<dyn HdcTransport>,
     target: &DeviceTarget,
     package: &BundlePackage,
-    allow_large: bool,
+    mode: IconFetchMode,
 ) -> IconOutcome {
     let Some(cache) = icon_cache_path(&package.bundle, &package.stamp()) else {
         return IconOutcome::Missing;
@@ -1222,19 +1243,17 @@ async fn fetch_bundle_icon(
     if cache.with_extension("none").exists() {
         return IconOutcome::Missing;
     }
-    if !allow_large
-        && package
-            .haps
-            .iter()
-            .all(|hap| hap.size_bytes > BULK_ICON_HAP_LIMIT)
-    {
+    let too_large = |hap: &fhdc_domain::BundleHap| {
+        mode == IconFetchMode::Bulk && hap.size_bytes > BULK_ICON_HAP_LIMIT
+    };
+    if package.haps.iter().all(too_large) {
         return IconOutcome::Skipped;
     }
 
     let mut pulled_any = false;
     let mut icon = None;
     for hap in &package.haps {
-        if !allow_large && hap.size_bytes > BULK_ICON_HAP_LIMIT {
+        if too_large(hap) {
             continue;
         }
         let Ok(remote) = RemotePath::new(hap.path.as_str()) else {
