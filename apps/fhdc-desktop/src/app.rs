@@ -909,30 +909,11 @@ impl FhdcApp {
                         });
                         ui.end_row();
                         ui.label("标题栏");
-                        ui.vertical(|ui| {
-                            if ui
-                                .selectable_label(!self.native_titlebar, "应用自绘")
-                                .clicked()
-                                && self.native_titlebar
-                            {
-                                self.restart_with_title_bar(false);
-                            }
-                            if ui
-                                .selectable_label(self.native_titlebar, "Windows 原生")
-                                .clicked()
-                                && !self.native_titlebar
-                            {
-                                self.restart_with_title_bar(true);
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "「应用自绘」隐藏系统标题栏,由顶部工具栏兼任标题栏:\
-                                     拖动移动、双击最大化、右端为窗口按钮。切换会重启应用。",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        });
+                        let mut native = self.native_titlebar;
+                        if ui.checkbox(&mut native, "Windows 原生标题栏").changed() {
+                            self.native_titlebar = native;
+                            self.restart_with_title_bar(native);
+                        }
                         ui.end_row();
                         ui.label(egui::RichText::new("hdc").strong());
                         ui.label("");
