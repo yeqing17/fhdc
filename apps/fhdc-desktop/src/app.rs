@@ -35,6 +35,8 @@ use crate::theme;
 
 const NAVIGATION_WIDTH: f32 = 118.0;
 const NAVIGATION_WIDTH_COLLAPSED: f32 = 44.0;
+/// 顶栏左右内边距,与侧栏导航项的起点对齐(参考 fadb)。
+const TOP_BAR_MARGIN_X: i8 = 12;
 const TOAST_DURATION: Duration = Duration::from_secs(3);
 const REMEMBERED_ENDPOINTS: usize = 8;
 
@@ -541,32 +543,45 @@ impl FhdcApp {
                 context.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             }
 
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                self.brand(ui);
-                ui.separator();
-                self.device_selector(ui);
-                if ui.button("⟲ 刷新设备").clicked() {
-                    self.send(BackendCommand::RefreshDevices);
-                }
-                if ui
-                    .selectable_label(self.windows.manager, "连接管理")
-                    .clicked()
-                {
-                    self.windows.manager = !self.windows.manager;
-                }
-                ui.separator();
-                let theme_label = if self.dark { "🌙" } else { "☀" };
-                ui.toggle_value(&mut self.dark, theme_label)
-                    .on_hover_text("切换浅色/深色主题");
-                if ui.selectable_label(self.windows.settings, "⚙").clicked() {
-                    self.windows.settings = !self.windows.settings;
-                }
-                if custom_chrome {
-                    self.window_controls(ui, context);
-                }
-            });
-            ui.add_space(3.0);
+            ui.add_space(2.0);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(TOP_BAR_MARGIN_X, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // 品牌区占满侧栏宽度:设备选择器从侧栏右边缘开始,
+                        // 视觉上与下方导航栏连成一条边线。
+                        let content_left = ui.max_rect().left();
+                        self.brand(ui);
+                        let spent = ui.cursor().left() - content_left;
+                        let nav_width = if self.nav_collapsed {
+                            NAVIGATION_WIDTH_COLLAPSED
+                        } else {
+                            NAVIGATION_WIDTH
+                        };
+                        ui.add_space((nav_width - f32::from(TOP_BAR_MARGIN_X) - spent).max(6.0));
+                        self.device_selector(ui);
+                        if ui.button("⟲ 刷新设备").clicked() {
+                            self.send(BackendCommand::RefreshDevices);
+                        }
+                        if ui
+                            .selectable_label(self.windows.manager, "连接管理")
+                            .clicked()
+                        {
+                            self.windows.manager = !self.windows.manager;
+                        }
+                        ui.separator();
+                        let theme_label = if self.dark { "🌙" } else { "☀" };
+                        ui.toggle_value(&mut self.dark, theme_label)
+                            .on_hover_text("切换浅色/深色主题");
+                        if ui.selectable_label(self.windows.settings, "⚙").clicked() {
+                            self.windows.settings = !self.windows.settings;
+                        }
+                        if custom_chrome {
+                            self.window_controls(ui, context);
+                        }
+                    });
+                });
+            ui.add_space(2.0);
             if let Some(reason) = &self.hdc_unavailable {
                 ui.colored_label(
                     theme::palette(ui.visuals().dark_mode).warn,
@@ -579,9 +594,9 @@ impl FhdcApp {
     /// 左上角的 logo 与名称(与任务栏、exe 图标同一枚)。
     fn brand(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            logo(ui, 22.0);
+            logo(ui, 26.0);
             // 跟随前景色(深色主题下为白),不用主题蓝。
-            ui.label(egui::RichText::new("fhdc").strong());
+            ui.label(egui::RichText::new("fhdc").strong().size(18.0));
         });
     }
 

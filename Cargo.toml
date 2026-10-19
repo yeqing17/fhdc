@@ -54,6 +54,12 @@ all = { level = "warn", priority = -1 }
 [profile.dev.package."*"]
 opt-level = 2
 
+# ring 的 C 代码在 /Z7 调试信息下触发 MSVC D8050(写调试记录失败),
+# 本机 MSVC 14.43 + cc-rs 环境可复现;关掉这个依赖的调试信息即可,
+# 不影响 Rust 代码的单步调试。
+[profile.dev.package.ring]
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

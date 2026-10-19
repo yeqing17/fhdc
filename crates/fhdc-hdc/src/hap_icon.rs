@@ -255,12 +255,31 @@ mod tests {
 
     #[test]
     fn extracts_icon_from_module_json_reference() {
-        let path = std::env::temp_dir().join(format!("fhdc_tiny_{}.hap", std::process::id()));
-        std::fs::write(&path, TINY_HAP).expect("write fixture");
-        let icon = extract_hap_icon(&path).expect("icon");
-        assert!(is_supported_image(&icon));
-        assert!(icon.starts_with(&[0x89, b'P', b'N', b'G']));
-        let _ = std::fs::remove_file(&path);
+        // 写进 target/ 而不是系统临时目录:后者的位置由环境变量决定,
+        // 在 TMP/TEMP 配置异常的机器上(如指向受限的 C:\WINDOWS\TEMP)
+        // 会写不进去。
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        // 某些安全软件会拦截新编译的未签名进程写文件(本机 Windows
+        // Defender 转主动后出现过)。环境不允许时跳过,不算失败。
+        if std::fs::create_dir_all(&directory).is_err() {
+            eprintln!("跳过:无法创建测试目录(安全软件可能拦截了新编译的进程)");
+            return;
+        }
+        let path = directory.join("fhdc_tiny.bin");
+        let Err(error) = std::fs::write(&path, TINY_HAP) else {
+            let icon = extract_hap_icon(&path).expect("icon");
+            assert!(is_supported_image(&icon));
+            assert!(icon.starts_with(&[0x89, b'P', b'N', b'G']));
+            let _ = std::fs::remove_file(&path);
+            return;
+        };
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!("跳过:环境拒绝写入(安全软件可能拦截了新编译的进程)");
+            return;
+        }
+        panic!("write fixture to {}: {error}", path.display());
     }
 
     /// 用真实的设备 HAP 验证(需要 `FHDC_TEST_HAP` 指向本地 .hap)。
