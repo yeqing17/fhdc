@@ -596,7 +596,7 @@ impl FhdcApp {
         ui.horizontal(|ui| {
             logo(ui, 26.0);
             // 跟随前景色(深色主题下为白),不用主题蓝。
-            ui.label(egui::RichText::new("fhdc").strong().size(18.0));
+            ui.label(egui::RichText::new("Fhdc").strong().size(18.0));
         });
     }
 
@@ -1239,7 +1239,7 @@ fn apply_pending_update() -> Result<(), String> {
 /// (eframe 拿不到窗口创建前的持久化设置)。
 pub fn viewport_builder(native_titlebar: bool) -> ViewportBuilder {
     ViewportBuilder::default()
-        .with_title("fhdc — 鸿蒙调试工具箱")
+        .with_title("Fhdc — 鸿蒙调试工具箱")
         .with_decorations(native_titlebar)
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([900.0, 600.0])
