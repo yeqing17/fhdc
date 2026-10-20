@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "fhdc"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "arboard",
  "eframe",
@@ -1016,14 +1016,14 @@ dependencies = [
 
 [[package]]
 name = "fhdc-device"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "fhdc-domain",
 ]
 
 [[package]]
 name = "fhdc-domain"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "fhdc-fake"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "fhdc-domain",
@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "fhdc-hdc"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "fhdc-domain",

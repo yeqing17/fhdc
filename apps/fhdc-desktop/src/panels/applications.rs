@@ -612,7 +612,10 @@ impl AppsState {
         let Some(target) = ctx.target.clone() else {
             return;
         };
-        commands.push(BackendCommand::LoadBundleDetails(target.clone(), name.clone()));
+        commands.push(BackendCommand::LoadBundleDetails(
+            target.clone(),
+            name.clone(),
+        ));
         if !self.icons_loading
             && !self.icons.contains_key(&name)
             && !self.icon_requests.contains(&name)
@@ -624,7 +627,13 @@ impl AppsState {
     }
 
     /// 网格单元与列表行共用的右键菜单。
-    fn action_menu(&mut self, ui: &mut Ui, ctx: &PanelCtx, commands: &mut Commands, name: &BundleName) {
+    fn action_menu(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &PanelCtx,
+        commands: &mut Commands,
+        name: &BundleName,
+    ) {
         ui.label(egui::RichText::new(name.as_str()).small().weak());
         ui.separator();
         if ui.button("复制包名").clicked() {
@@ -697,8 +706,10 @@ impl AppsState {
                                 .and_then(|package| package.label.clone())
                                 .unwrap_or_else(|| name.as_str().to_owned());
                             let is_selected = self.selected.as_ref() == Some(name);
-                            let (rect, response) = ui
-                                .allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::click());
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(cell_w, cell_h),
+                                egui::Sense::click(),
+                            );
                             let visuals = ui.visuals().clone();
                             let painter = ui.painter().clone();
                             if is_selected || response.hovered() {
@@ -721,7 +732,13 @@ impl AppsState {
                                 egui::pos2(rect.center().x, rect.top() + 6.0 + icon_size * 0.5),
                                 egui::vec2(icon_size, icon_size),
                             );
-                            draw_app_icon_at(ui, icon.as_ref(), &display_name, icon_rect, icon_size);
+                            draw_app_icon_at(
+                                ui,
+                                icon.as_ref(),
+                                &display_name,
+                                icon_rect,
+                                icon_size,
+                            );
                             let galley = elide_text(
                                 &painter,
                                 &display_name,
@@ -784,8 +801,7 @@ impl AppsState {
                         .horizontal(|ui| {
                             draw_app_icon(ui, icon.as_ref(), &display_name, 20.0);
                             ui.add(
-                                egui::Button::selectable(is_selected, display_name.clone())
-                                    .small(),
+                                egui::Button::selectable(is_selected, display_name.clone()).small(),
                             )
                             .on_hover_text(name.as_str())
                         })
@@ -879,7 +895,8 @@ impl AppsState {
                     .small()
                     .color(crate::theme::ACCENT),
             );
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
         }
         if let Some(system) = self.details.as_ref().and_then(|details| details.system) {
             ui.horizontal(|ui| {
@@ -887,7 +904,11 @@ impl AppsState {
                     [104.0, 18.0],
                     egui::Label::new(egui::RichText::new("类型").weak()),
                 );
-                ui.label(if system { "系统应用" } else { "三方应用" });
+                ui.label(if system {
+                    "系统应用"
+                } else {
+                    "三方应用"
+                });
             });
         }
         ui.add_space(8.0);
@@ -934,9 +955,7 @@ impl AppsState {
                 .any(|bundle| self.filter.accepts(bundle))
         {
             // 该分类下确实没有应用,和"还没加载出来"要区分开。
-            ui.label(
-                egui::RichText::new(format!("(没有{})", self.filter.label())).weak(),
-            );
+            ui.label(egui::RichText::new(format!("(没有{})", self.filter.label())).weak());
         } else if !self.query.is_empty() {
             ui.label(egui::RichText::new("(没有匹配的应用)").weak());
         }
@@ -944,7 +963,12 @@ impl AppsState {
 }
 
 /// 内联应用图标(详情栏/列表行);缺图标时画一个首字母圆形占位,保持行对齐。
-fn draw_app_icon(ui: &mut Ui, texture: Option<&egui::TextureHandle>, fallback_text: &str, size: f32) {
+fn draw_app_icon(
+    ui: &mut Ui,
+    texture: Option<&egui::TextureHandle>,
+    fallback_text: &str,
+    size: f32,
+) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     draw_app_icon_at(ui, texture, fallback_text, rect, size);
 }
@@ -1012,7 +1036,8 @@ fn detail_value(ui: &mut Ui, value: &str) -> bool {
     let max_width = ui.available_width();
     let galley = elide_text(ui.painter(), value, font, color, max_width);
     let height = galley.size().y.max(18.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(max_width, height), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(max_width, height), egui::Sense::click());
     ui.painter().galley(rect.min, galley, color);
     response.clicked()
 }
