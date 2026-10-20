@@ -198,7 +198,7 @@ impl FhdcApp {
             overview: OverviewState::default(),
             shell,
             files: FilesState::default(),
-            apps: AppsState::default(),
+            apps: AppsState::new(storage),
             processes: ProcessesState::default(),
             hilog: HilogState::default(),
             screenshot: ScreenshotState::default(),
@@ -995,7 +995,9 @@ impl FhdcApp {
             self.snapshot = DeviceSnapshot::default();
             self.overview = OverviewState::default();
             self.files = FilesState::default();
+            let (view, icon_size_idx) = self.apps.view_prefs();
             self.apps = AppsState::default();
+            self.apps.set_view_prefs(view, icon_size_idx);
             self.processes = ProcessesState::default();
             self.screenshot = ScreenshotState::default();
             if let Some(command) = self.hilog.reset_for(None) {
@@ -1201,6 +1203,7 @@ impl eframe::App for FhdcApp {
             storage.set_string("fhdc.endpoints", value);
         }
         self.shell.save(storage);
+        self.apps.save(storage);
     }
 }
 
